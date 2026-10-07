@@ -396,8 +396,19 @@ static int zip_mkpath(char *path, size_t pos) {
   strncpy(npath, path, len);
   npath[MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE] = '\0';
 
-  if (MZ_FILE_STAT(npath, &st) < 0) {
-    return ZIP_ENOFILE;
+  // the stat of msvcrt.dll (MinGW) fails with ENOENT on a directory name with
+  // a trailing separator ("dir\"), which pos always includes; UCRT and POSIX
+  // accept it. check the directory without it, keeping a root ("\", "C:\")
+  {
+    size_t dlen = len;
+    while (dlen > FILESYSTEM_PREFIX_LEN(npath) + 1 && ISSLASH(npath[dlen - 1])) {
+      --dlen;
+    }
+    npath[dlen] = '\0';
+    if (MZ_FILE_STAT(npath, &st) < 0) {
+      return ZIP_ENOFILE;
+    }
+    memcpy(npath + dlen, path + dlen, len - dlen);
   }
 
   for (p = path + len; *p && len < MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE; p++) {
