@@ -386,6 +386,31 @@ static const char *zip_basename(const char *name) {
 
 #if ZIP_ENABLE_INFLATE
 #ifndef MINIZ_NO_STDIO
+// length of the root of a path, its separator included: "\" (1), "C:\" (3)
+// and, on Windows, "\\server\share\" for a UNC path
+static size_t zip_path_root_len(const char *path, size_t len) {
+  size_t n = FILESYSTEM_PREFIX_LEN(path) + 1;
+#if defined(_WIN32) || defined(__WIN32__) || defined(_MSC_VER) ||              \
+    defined(__MINGW32__)
+  if (len > 2 && ISSLASH(path[0]) && ISSLASH(path[1])) {
+    int part;
+    n = 2;
+    // the server name, then the share name, each with its separator
+    for (part = 0; part < 2; ++part) {
+      while (n < len && !ISSLASH(path[n])) {
+        ++n;
+      }
+      if (n < len) {
+        ++n;
+      }
+    }
+  }
+#else
+  (void)len;
+#endif
+  return n;
+}
+
 static int zip_mkpath(char *path, size_t pos) {
   char *p;
   char npath[MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE + 1];
@@ -398,10 +423,12 @@ static int zip_mkpath(char *path, size_t pos) {
 
   // the stat of msvcrt.dll (MinGW) fails with ENOENT on a directory name with
   // a trailing separator ("dir\"), which pos always includes; UCRT and POSIX
-  // accept it. check the directory without it, keeping a root ("\", "C:\")
+  // accept it. check the directory without it, keeping a root ("\", "C:\",
+  // "\\server\share\") whole: msvcrt needs the separator on a share root
   {
+    size_t root = zip_path_root_len(npath, len);
     size_t dlen = len;
-    while (dlen > FILESYSTEM_PREFIX_LEN(npath) + 1 && ISSLASH(npath[dlen - 1])) {
+    while (dlen > root && ISSLASH(npath[dlen - 1])) {
       --dlen;
     }
     npath[dlen] = '\0';
