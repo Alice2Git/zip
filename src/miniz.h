@@ -5085,19 +5085,19 @@ static time_t mz_filetime_to_time_t(const FILETIME *pTime) {
   t.LowPart = pTime->dwLowDateTime;
   t.HighPart = pTime->dwHighDateTime;
   /* 100 ns intervals since 1601-01-01 -> seconds since 1970-01-01 */
-  return (time_t)((t.QuadPart - 116444736000000000ULL) / 10000000ULL);
+  return (time_t)(((LONGLONG)t.QuadPart - 116444736000000000LL) / 10000000LL);
 }
 
 static int mz_stat(const char *path, struct _stat *buffer) {
   WCHAR *wPath = mz_utf8z_to_widechar(path);
+  WIN32_FILE_ATTRIBUTE_DATA fad;
   int res = _wstat(wPath, buffer);
-  if (res != 0) {
-    /* msvcrt.dll's _wstat rejects paths that name an existing file or
-     * directory: "\\?\" paths, a directory with a trailing separator and a
-     * share root without one ("\\server\share"). UCRT accepts them all; ask
-     * the file system directly and fill what _wstat would */
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (GetFileAttributesExW(wPath, GetFileExInfoStandard, &fad)) {
+  if (GetFileAttributesExW(wPath, GetFileExInfoStandard, &fad)) {
+    if (res != 0) {
+      /* msvcrt.dll's _wstat rejects paths that name an existing file or
+       * directory: "\\?\" paths, a directory with a trailing separator and a
+       * share root without one ("\\server\share"). UCRT accepts them all;
+       * fill what _wstat would from the file system */
       unsigned short mode = _S_IREAD;
       if (!(fad.dwFileAttributes & FILE_ATTRIBUTE_READONLY)) {
         mode |= _S_IWRITE;
@@ -5115,11 +5115,15 @@ static int mz_stat(const char *path, struct _stat *buffer) {
       buffer->st_size = (fad.nFileSizeHigh || fad.nFileSizeLow > 0x7FFFFFFFUL)
                             ? (_off_t)0x7FFFFFFF
                             : (_off_t)fad.nFileSizeLow;
-      buffer->st_atime = mz_filetime_to_time_t(&fad.ftLastAccessTime);
-      buffer->st_mtime = mz_filetime_to_time_t(&fad.ftLastWriteTime);
-      buffer->st_ctime = mz_filetime_to_time_t(&fad.ftCreationTime);
       res = 0;
     }
+    /* msvcrt.dll's _wstat turns the UTC file times into local time with the
+     * daylight saving offset in effect now and back with the offset of the
+     * file's date: across a DST change they come out an hour off. Take them
+     * from the file system, as UCRT does */
+    buffer->st_atime = mz_filetime_to_time_t(&fad.ftLastAccessTime);
+    buffer->st_mtime = mz_filetime_to_time_t(&fad.ftLastWriteTime);
+    buffer->st_ctime = mz_filetime_to_time_t(&fad.ftCreationTime);
   }
   free(wPath);
   return res;
@@ -5159,6 +5163,37 @@ static int mz_remove(const char *pFilename) {
 #ifndef MINIZ_NO_TIME
 #include <sys/utime.h>
 
+#if defined(__MINGW32__)
+static FILETIME mz_time_t_to_filetime(time_t time) {
+  ULARGE_INTEGER t;
+  FILETIME ft;
+  /* seconds since 1970-01-01 -> 100 ns intervals since 1601-01-01 */
+  t.QuadPart = (ULONGLONG)((LONGLONG)time * 10000000LL + 116444736000000000LL);
+  ft.dwLowDateTime = t.LowPart;
+  ft.dwHighDateTime = t.HighPart;
+  return ft;
+}
+
+/* msvcrt.dll's _wutime has the daylight saving error of its _wstat (see
+ * mz_stat): set the UTC file times directly */
+static int mz_utime(const char *pFilename, struct utimbuf *pTimes) {
+  WCHAR *wFilename = mz_utf8z_to_widechar(pFilename);
+  FILETIME atime = mz_time_t_to_filetime(pTimes->actime);
+  FILETIME mtime = mz_time_t_to_filetime(pTimes->modtime);
+  int res = -1;
+  /* FILE_FLAG_BACKUP_SEMANTICS lets a directory be opened too */
+  HANDLE h = CreateFileW(wFilename, FILE_WRITE_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  free(wFilename);
+  if (h == INVALID_HANDLE_VALUE)
+    return -1;
+  if (SetFileTime(h, NULL, &atime, &mtime))
+    res = 0;
+  CloseHandle(h);
+  return res;
+}
+#else
 static int mz_utime(const char *pFilename, struct utimbuf *pTimes) {
   WCHAR *wFilename = mz_utf8z_to_widechar(pFilename);
   struct _utimbuf t;
@@ -5169,6 +5204,7 @@ static int mz_utime(const char *pFilename, struct utimbuf *pTimes) {
   free(wFilename);
   return res;
 }
+#endif
 #define MZ_UTIME mz_utime
 #endif
 #define CHMOD(f, m) mz_chmod(f, m)
