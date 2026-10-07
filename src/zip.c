@@ -442,6 +442,12 @@ static int zip_mkpath(char *path, size_t pos) {
     if (ISSLASH(*p)) {
 #if defined(_WIN32) || defined(__WIN32__) || defined(_MSC_VER) ||              \
     defined(__MINGW32__)
+      // entry names use '/', which a "\\?\" path does not normalize: it would
+      // be part of the name. '\' works with every Windows path
+      if ('/' == *p) {
+        *p = '\\';
+      }
+
       if (MZ_MKDIR(npath) == -1) {
         if (errno != EEXIST) {
           return ZIP_EMKDIR;

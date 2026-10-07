@@ -5080,9 +5080,47 @@ static FILE *mz_freopen(const char *pPath, const char *pMode, FILE *pStream) {
 }
 
 #if defined(__MINGW32__)
+static time_t mz_filetime_to_time_t(const FILETIME *pTime) {
+  ULARGE_INTEGER t;
+  t.LowPart = pTime->dwLowDateTime;
+  t.HighPart = pTime->dwHighDateTime;
+  /* 100 ns intervals since 1601-01-01 -> seconds since 1970-01-01 */
+  return (time_t)((t.QuadPart - 116444736000000000ULL) / 10000000ULL);
+}
+
 static int mz_stat(const char *path, struct _stat *buffer) {
   WCHAR *wPath = mz_utf8z_to_widechar(path);
   int res = _wstat(wPath, buffer);
+  if (res != 0) {
+    /* msvcrt.dll's _wstat rejects paths that name an existing file or
+     * directory: "\\?\" paths, a directory with a trailing separator and a
+     * share root without one ("\\server\share"). UCRT accepts them all; ask
+     * the file system directly and fill what _wstat would */
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(wPath, GetFileExInfoStandard, &fad)) {
+      unsigned short mode = _S_IREAD;
+      if (!(fad.dwFileAttributes & FILE_ATTRIBUTE_READONLY)) {
+        mode |= _S_IWRITE;
+      }
+      if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        mode |= _S_IFDIR | _S_IEXEC;
+      } else {
+        mode |= _S_IFREG;
+      }
+      /* like msvcrt, copy the owner bits to group and other */
+      mode |= (unsigned short)(((mode & 0700) >> 3) | ((mode & 0700) >> 6));
+      memset(buffer, 0, sizeof(*buffer));
+      buffer->st_mode = mode;
+      buffer->st_nlink = 1;
+      buffer->st_size = (fad.nFileSizeHigh || fad.nFileSizeLow > 0x7FFFFFFFUL)
+                            ? (_off_t)0x7FFFFFFF
+                            : (_off_t)fad.nFileSizeLow;
+      buffer->st_atime = mz_filetime_to_time_t(&fad.ftLastAccessTime);
+      buffer->st_mtime = mz_filetime_to_time_t(&fad.ftLastWriteTime);
+      buffer->st_ctime = mz_filetime_to_time_t(&fad.ftCreationTime);
+      res = 0;
+    }
+  }
   free(wPath);
   return res;
 }
@@ -5102,9 +5140,38 @@ static int mz_mkdir(const char *pDirname) {
   return res;
 }
 
+/* chmod, utime and remove take UTF-8 too: the narrow CRT functions read the
+ * path in the ANSI code page and miss any name outside ASCII */
+static int mz_chmod(const char *pFilename, int mode) {
+  WCHAR *wFilename = mz_utf8z_to_widechar(pFilename);
+  int res = _wchmod(wFilename, mode);
+  free(wFilename);
+  return res;
+}
+
+static int mz_remove(const char *pFilename) {
+  WCHAR *wFilename = mz_utf8z_to_widechar(pFilename);
+  int res = _wremove(wFilename);
+  free(wFilename);
+  return res;
+}
+
 #ifndef MINIZ_NO_TIME
 #include <sys/utime.h>
+
+static int mz_utime(const char *pFilename, struct utimbuf *pTimes) {
+  WCHAR *wFilename = mz_utf8z_to_widechar(pFilename);
+  struct _utimbuf t;
+  int res;
+  t.actime = pTimes->actime;
+  t.modtime = pTimes->modtime;
+  res = _wutime(wFilename, &t);
+  free(wFilename);
+  return res;
+}
+#define MZ_UTIME mz_utime
 #endif
+#define CHMOD(f, m) mz_chmod(f, m)
 #define MZ_FOPEN mz_fopen
 #define MZ_FCLOSE fclose
 #define MZ_FREAD fread
@@ -5120,7 +5187,7 @@ static int mz_mkdir(const char *pDirname) {
 #endif
 #define MZ_FFLUSH fflush
 #define MZ_FREOPEN mz_freopen
-#define MZ_DELETE_FILE remove
+#define MZ_DELETE_FILE mz_remove
 #define MZ_MKDIR(d) mz_mkdir(d)
 
 #elif defined(__WATCOMC__)
@@ -5220,6 +5287,9 @@ static int mz_mkdir(const char *pDirname) {
 
 #ifndef CHMOD
 #define CHMOD(f, m) chmod(f, m)
+#endif
+#ifndef MZ_UTIME
+#define MZ_UTIME utime
 #endif
 
 #define MZ_TOLOWER(c) ((((c) >= 'A') && ((c) <= 'Z')) ? ((c) - 'A' + 'a') : (c))
@@ -5504,7 +5574,7 @@ static mz_bool mz_zip_set_file_times(const char *pFilename,
   t.actime = access_time;
   t.modtime = modified_time;
 
-  return !utime(pFilename, &t);
+  return !MZ_UTIME(pFilename, &t);
 }
 #endif /* #ifndef MINIZ_NO_STDIO */
 #endif /* #ifndef MINIZ_NO_TIME */
