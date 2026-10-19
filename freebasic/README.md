@@ -26,7 +26,7 @@ freebasic/
     ├── run_tests.cmd    compilează și rulează testele și exemplele
     ├── test_c.bas       nivelul 1: fiecare grup de funcții din zip.h
     ├── test_fb.bas      nivelul 2: toate metodele, căi cu diacritice, UNC și \\?\
-    └── test_margini.bas cu TestKit: dimensiuni de date și CRC, niveluri de compresie, citire pe bucăți
+    └── test_margini.bas cu TestKit: dimensiuni de date și CRC, niveluri de compresie, citire pe bucăți, arhive stricate
 ```
 
 ## Compilare
@@ -95,6 +95,7 @@ Parametrii al căror nume e cuvânt rezervat în FreeBASIC au primit `_`: `len_`
 - Un apel invers al lui `zip_extract` care întoarce o valoare negativă oprește extragerea, dar `zip_extract` întoarce **0**.
 - O intrare criptată citită fără parolă dă `ZIP_EMEMNOALLOC` (-18), nu `ZIP_EPASSWD`. Cu parolă greșită dă `ZIP_EPASSWD`.
 - Dacă `zip_entry_fwrite` eșuează (de exemplu fișierul nu există), intrarea deschisă rămâne în arhivă, goală, iar codul întors este `ZIP_ENOENT`.
+- Fără parolă, `zip_entry_fread` și `zip_extract` scriu fișierul și abia apoi verifică CRC-ul: la un CRC greșit întorc o eroare, dar fișierul rămâne pe disc. Cu parolă, verificarea se face înainte de scriere și nu rămâne nimic. `ExtractEntry` șterge fișierul nou la eșec (verificat în `test_margini.bas`).
 - Arhivele create cu `'w'` sunt scrise în format zip64 (`zip_is64` = 1).
 
 ## Nivelul 2: clasa ZipArchive
@@ -158,9 +159,9 @@ Celelalte metode întorc `ZIP_EINVMODE` și nu ating arhiva. În biblioteca C, `
 | `AddFile(nume, cale)` | verifică întâi că fișierul există (altfel `ZIP_ENOFILE`), ca să nu rămână o intrare goală |
 | `AddDirectory(nume)` | intrare `nume/` |
 | `ReadBytes(nume, octeți)`, `ReadBytesAt(index, octeți)`, `ReadText(nume, text)` | un director dă `ZIP_EINVENTTYPE` |
-| `ExtractEntry(nume, cale)` | scrie intrarea într-un fișier; directorul lui trebuie să existe |
+| `ExtractEntry(nume, cale)` | scrie intrarea într-un fișier; directorul lui trebuie să existe; la eșec (de exemplu CRC greșit) un fișier nou e șters, iar unul care exista poate rămâne suprascris |
 | `DeleteEntries(nume())`, `DeleteEntriesAt(indecși())` | întorc numărul de intrări șterse |
-| `ExtractAll(arhivă, director, apel = 0, date = 0)` (static) | directorul trebuie să existe; apelul invers primește calea fiecărui fișier extras |
+| `ExtractAll(arhivă, director, apel = 0, date = 0)` (static) | directorul trebuie să existe; apelul invers primește calea fiecărui fișier extras; la eșec fișierele deja scrise rămân, inclusiv cel la care s-a oprit (cu date netestate, dacă CRC-ul lui e greșit) |
 | `ExtractAllFromMemory(octeți, director, apel = 0, date = 0)` (static) | |
 | `CreateFromFiles(arhivă, fișiere())` (static) | fiecare fișier intră sub numele lui, fără director |
 | `ErrorText(cod)` (static) | |

@@ -1,5 +1,6 @@
 '' test_margini.bas - marginile legaturii FreeBASIC cu TestKit, dincolo de test_c si test_fb:
-'' dimensiuni de date si CRC calculat independent, niveluri de compresie, citire pe bucati (nivelul 1).
+'' dimensiuni de date si CRC calculat independent, niveluri de compresie, citire pe bucati (nivelul 1),
+'' arhive stricate.
 ''
 ''   fbc64 -w all -exx test_margini.bas -i ..\inc -i ..\..\..\TestKit -p out\lib -p ..\bin-win64
 ''   test_margini [--filter=Date.*] [--isolate] [-v]          (libzip.dll langa exe)
@@ -712,6 +713,242 @@ TEST_CASE( Bucati, ExtractOprit )
         CHECK_MSG( FirstDiff(again.data_, BIG_DATA) = -1, "a doua extragere difera" )
         zip_entry_close(o.z)
     next
+END_TEST_CASE
+
+'' ================================================================== 4. arhive stricate
+'' Regula: o arhiva stricata fie e refuzata la deschidere, fie fiecare citire (nivelul 2 si nivelul 1)
+'' intoarce o eroare sau exact datele originale. Niciodata date gresite fara eroare si niciun crash.
+
+'' intrarile arhivelor mici de la acest grup, in ordinea adaugarii ("" pentru director)
+dim shared as string CORRUPT_NAMES(0 to 3), CORRUPT_DATA(0 to 3)
+CORRUPT_NAMES(0) = "a.txt" : CORRUPT_DATA(0) = MakeData(300, KindText)
+CORRUPT_NAMES(1) = "b.bin" : CORRUPT_DATA(1) = MakeData(64, KindRandom, 4242)
+CORRUPT_NAMES(2) = "gol.bin" : CORRUPT_DATA(2) = ""
+CORRUPT_NAMES(3) = "c/" : CORRUPT_DATA(3) = ""
+
+'' arhiva mica a variantei v: 0 = nivel 6, 1 = nivel 0 (stocat), 2 = nivel 6 cu parola
+function CorruptPassword(byval v as long) as string
+    return iif(v = 2, "parola-x", "")
+end function
+
+function CorruptVariant(byval v as long) as string
+    return iif(v = 0, "nivel 6", iif(v = 1, "nivel 0", "cu parola"))
+end function
+
+function SmallArchive(byval v as long) as string
+    dim as ZipArchive w
+    dim as ustring pw = CorruptPassword(v)
+    if w.CreateInMemory(iif(v = 1, 0, 6), pw) <> 0 then return ""
+    for i as long = 0 to 2
+        if w.AddBytes(CORRUPT_NAMES(i), CORRUPT_DATA(i)) <> 0 then return ""
+    next
+    if w.AddDirectory("c") <> 0 then return ""
+    dim as string b
+    if w.ToBytes(b) <> 0 then return ""
+    return b
+end function
+
+'' citeste tot ce se poate din bytes, pe ambele niveluri; intoarce descrierea primei citiri care a dat
+'' date gresite fara eroare ("" = nicio problema)
+function SilentBadRead(byref bytes as const string, byref pw as const string) as string
+    '' nivelul 2
+    dim as ZipArchive r
+    dim as ustring pwU = pw
+    if r.OpenMemory(bytes, ZipRead, pwU) = 0 then
+        dim as integer n = r.Count
+        dim as ZipEntryInfo entries()
+        r.ListEntries(entries())
+        for i as long = 0 to iif(n < 4, n, 4) - 1
+            dim as string got
+            if r.ReadBytesAt(i, got) = 0 andalso got <> CORRUPT_DATA(i) then
+                return "ReadBytesAt(" & i & "): " & len(got) & " octeti gresiti"
+            end if
+        next
+    end if
+
+    '' nivelul 1
+    dim as string copy_ = bytes
+    dim as zip_t ptr z
+    if len(pw) then
+        z = zip_stream_open_with_password(strptr(copy_), len(copy_), 0, asc("r"), strptr(pw))
+    else
+        z = zip_stream_open(strptr(copy_), len(copy_), 0, asc("r"))
+    end if
+    if z = 0 then return ""
+    dim as string result
+    dim as integer n = zip_entries_total(z)
+    for i as long = 0 to iif(n < 4, n, 4) - 1
+        if zip_entry_openbyindex(z, i) <> 0 then continue for
+        dim as string want = CORRUPT_DATA(i)
+        dim as any ptr buf = 0
+        dim as uinteger size = 0
+        dim as integer k = zip_entry_read(z, @buf, @size)
+        if k >= 0 then
+            dim as string got = space(size)
+            if size > 0 then memcpy(strptr(got), buf, size)
+            if got <> want andalso len(result) = 0 then result = "zip_entry_read(" & i & "): " & size & " octeti gresiti"
+        end if
+        if buf then deallocate(buf)
+        dim as string win
+        k = ReadWindow(z, 0, len(want) + 8, len(want) + 8, win)
+        if k = -1000 andalso len(result) = 0 then result = "noallocreadwithoffset(" & i & "): scrie dupa capat"
+        if k >= 0 andalso win <> left(want, k) andalso len(result) = 0 then result = "noallocreadwithoffset(" & i & "): date gresite"
+        dim as Collector col
+        if zip_entry_extract(z, @OnChunk, @col) = 0 andalso col.data_ <> want andalso len(result) = 0 then
+            result = "zip_entry_extract(" & i & "): " & len(col.data_) & " octeti gresiti"
+        end if
+        zip_entry_close(z)
+    next
+    zip_stream_close(z)
+    return result
+end function
+
+'' arhivele bune se citesc corect (altfel testele de mai jos nu spun nimic)
+TEST_CASE( Stricate, ArhiveleBune )
+    for v as long = 0 to 2
+        TEST_CONTEXT( CorruptVariant(v) )
+        dim as string b = SmallArchive(v)
+        REQUIRE_GT( clngint(len(b)), 0ll )
+        dim as ZipArchive r
+        dim as ustring pw = CorruptPassword(v)
+        REQUIRE_EQ( r.OpenMemory(b, ZipRead, pw), 0 )
+        REQUIRE_EQ( r.Count, 4 )
+        for i as long = 0 to 2
+            dim as string got
+            CHECK_EQ( r.ReadBytesAt(i, got), 0 )
+            CHECK_TRUE( got = CORRUPT_DATA(i) )
+        next
+        dim as string bad = SilentBadRead(b, CorruptPassword(v))
+        CHECK_MSG( bad = "", bad )
+        '' verificarea insasi: cu alte date asteptate, SilentBadRead trebuie sa observe diferenta
+        dim as string keep = CORRUPT_DATA(0)
+        CORRUPT_DATA(0)[5] xor= 1
+        CHECK_MSG( SilentBadRead(b, CorruptPassword(v)) <> "", "SilentBadRead nu vede date gresite" )
+        CORRUPT_DATA(0) = keep
+    next
+END_TEST_CASE
+
+'' orice prefix al arhivei (fara directorul central de la sfarsit) e refuzat la deschidere
+TEST_CASE( Stricate, Trunchiate )
+    dim as ustring d = WorkDir()
+    for v as long = 0 to 2
+        TEST_CONTEXT( CorruptVariant(v) )
+        dim as string b = SmallArchive(v)
+        dim as ustring pw = CorruptPassword(v)
+        for L as integer = 0 to len(b) - 1
+            dim as string part = left(b, L)
+            dim as ZipArchive r
+            dim as long e = r.OpenMemory(part, ZipRead, pw)
+            CHECK_MSG( e < 0, "prefixul de " & L & " octeti din " & len(b) & " s-a deschis" )
+            dim as string bad = SilentBadRead(part, CorruptPassword(v))
+            CHECK_MSG( bad = "", "prefixul de " & L & ": " & bad )
+            '' din fisier, pentru o parte din lungimi
+            if L mod 17 = 0 orelse L >= len(b) - 30 then
+                REQUIRE_TRUE( WriteAll(d & "\trunchiat.zip", part) )
+                dim as ZipArchive f
+                CHECK_MSG( f.OpenFile(d & "\trunchiat.zip", ZipRead, 0, pw) < 0, "fisierul trunchiat la " & L & " s-a deschis" )
+            end if
+        next
+    next
+END_TEST_CASE
+
+'' fiecare octet schimbat, pe rand: eroare sau datele bune, nimic altceva
+TEST_CASE( Stricate, OctetiSchimbati )
+    dim as ubyte masks(...) = { &hFF, &h01, &h80 }
+    for v as long = 0 to 2
+        TEST_CONTEXT( CorruptVariant(v) )
+        dim as string b = SmallArchive(v)
+        dim as long problems = 0
+        for p as integer = 0 to len(b) - 1
+            for m as long = 0 to ubound(masks)
+                dim as string x = b
+                x[p] xor= masks(m)
+                dim as string bad = SilentBadRead(x, CorruptPassword(v))
+                if len(bad) then
+                    problems += 1
+                    if problems <= 10 then CHECK_MSG( false, "octetul " & p & " xor &h" & hex(masks(m)) & ": " & bad )
+                end if
+            next
+        next
+        CHECK_MSG( problems = 0, problems & " modificari au dat date gresite fara eroare" )
+    next
+END_TEST_CASE
+
+'' CRC-ul gresit in directorul central: fiecare cale de citire si extragere da eroare
+TEST_CASE( Stricate, CrcGresit )
+    dim as ustring d = WorkDir()
+    for v as long = 0 to 2
+        TEST_CONTEXT( CorruptVariant(v) )
+        dim as string b = SmallArchive(v)
+        '' antetul din directorul central al primei intrari; CRC-ul e la +16
+        dim as integer cd = instr(b, "PK" & chr(1, 2))
+        REQUIRE_TRUE( cd > 0 )
+        b[cd - 1 + 16] xor= &h5A
+        dim as ustring pw = CorruptPassword(v)
+        dim as ZipArchive r
+        REQUIRE_EQ( r.OpenMemory(b, ZipRead, pw), 0 )
+        dim as string got
+        CHECK_LT( r.ReadBytes("a.txt", got), 0 )
+        '' ExtractEntry esuat nu lasa in urma un fisier nou cu date netestate
+        dim as ustring target = d & "\a_" & v & ".txt"
+        CHECK_LT( r.ExtractEntry("a.txt", target), 0 )
+        CHECK_MSG( FileExists(target) = false, "fisierul nou a ramas pe disc" )
+        '' un fisier care exista nu se sterge
+        dim as ustring old_ = d & "\vechi_" & v & ".txt"
+        REQUIRE_TRUE( WriteAll(old_, "vechi") )
+        CHECK_LT( r.ExtractEntry("a.txt", old_), 0 )
+        CHECK_TRUE( FileExists(old_) )
+        '' o intrare buna se extrage in continuare
+        dim as ustring okPath = d & "\b_" & v & ".bin"
+        CHECK_EQ( r.ExtractEntry("b.bin", okPath), 0 )
+        CHECK_TRUE( ReadAll(okPath) = CORRUPT_DATA(1) )
+        dim as string bad = SilentBadRead(b, CorruptPassword(v))
+        CHECK_MSG( bad = "", bad )
+        dim as ustring dx = d & "\tot_" & v
+        CreateDirectoryW(dx, 0)
+        '' ExtractAll nu primeste parola
+        if v <> 2 then
+            CHECK_LT( ZipArchive.ExtractAllFromMemory(b, dx), 0 )
+            dim as ustring pz = d & "\crc_" & v & ".zip"
+            REQUIRE_TRUE( WriteAll(pz, b) )
+            CHECK_LT( ZipArchive.ExtractAll(pz, dx), 0 )
+        end if
+    next
+END_TEST_CASE
+
+'' date care nu sunt arhive zip
+TEST_CASE( Stricate, NuSuntArhive )
+    dim as ustring d = WorkDir()
+    dim as string eocd = "PK" & chr(5, 6) & string(18, 0)                 '' arhiva goala corecta
+    dim as string eocd1 = "PK" & chr(5, 6) & string(4, 0) & chr(1, 0, 1, 0) & mkl(46) & mkl(1000) & chr(0, 0)
+    dim as string cases(...) = { "PK", "PK" & chr(3, 4), "PK" & chr(5, 6), MakeData(1000, KindRandom, 5), _
+        MakeData(1000, KindText), eocd1, string(4096, 0) }
+    for i as long = 0 to ubound(cases)
+        TEST_CONTEXT( "cazul " & i & " (" & len(cases(i)) & " octeti)" )
+        dim as ZipArchive r
+        CHECK_LT( r.OpenMemory(cases(i)), 0 )
+        CHECK_TRUE( r.IsOpen = false )
+        REQUIRE_TRUE( WriteAll(d & "\nu.zip", cases(i)) )
+        dim as ZipArchive f
+        CHECK_LT( f.OpenFile(d & "\nu.zip"), 0 )
+        dim as string bad = SilentBadRead(cases(i), "")
+        CHECK_MSG( bad = "", bad )
+    next
+    '' arhiva goala (doar sfarsitul directorului central) e corecta: 0 intrari
+    dim as ZipArchive g
+    CHECK_EQ( g.OpenMemory(eocd), 0 )
+    CHECK_EQ( g.Count, 0 )
+    REQUIRE_TRUE( WriteAll(d & "\gol.zip", eocd) )
+    dim as ZipArchive gf
+    CHECK_EQ( gf.OpenFile(d & "\gol.zip"), 0 )
+    CHECK_EQ( gf.Count, 0 )
+    '' fisier gol si director in loc de arhiva
+    REQUIRE_TRUE( WriteAll(d & "\zero.zip", "") )
+    dim as ZipArchive z0
+    CHECK_LT( z0.OpenFile(d & "\zero.zip"), 0 )
+    dim as ZipArchive zd
+    CHECK_LT( zd.OpenFile(d), 0 )
+    CHECK_TRUE( zd.IsOpen = false )
 END_TEST_CASE
 
 end TestKitMain( )

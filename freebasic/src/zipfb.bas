@@ -37,6 +37,16 @@ private function IsRegularFile(byref path as const ustring) as boolean
 #endif
 end function
 
+'' sterge un fisier
+private sub RemoveFile(byref path as const ustring)
+#ifdef __FB_WIN32__
+    DeleteFileW(path)
+#else
+    dim as string p8 = path
+    kill p8
+#endif
+end sub
+
 '' parola pentru biblioteca: NULL inseamna fara parola
 private function PasswordPtr(byref pw8 as const string) as const zstring ptr
     if len(pw8) = 0 then return 0
@@ -361,7 +371,12 @@ function ZipArchive.ExtractEntry(byref name_ as const ustring, byref path as con
     if r < 0 then return SetResult(r)
     defer zip_entry_close(handle_)
     if zip_entry_isdir(handle_) = 1 then return SetResult(ZIP_EINVENTTYPE)
-    return SetResult(zip_entry_fread(handle_, strptr(p8)))
+    '' fara parola, biblioteca scrie fisierul si abia apoi verifica CRC-ul: la eroare ar ramane
+    '' pe disc date netestate. Un fisier nou se sterge; unul care exista a fost deja suprascris.
+    dim as boolean existed = IsRegularFile(path)
+    r = zip_entry_fread(handle_, strptr(p8))
+    if r < 0 andalso existed = false then RemoveFile(path)
+    return SetResult(r)
 end function
 
 '' ---- stergere
