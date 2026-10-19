@@ -26,7 +26,7 @@ freebasic/
     ├── run_tests.cmd    compilează și rulează testele și exemplele
     ├── test_c.bas       nivelul 1: fiecare grup de funcții din zip.h
     ├── test_fb.bas      nivelul 2: toate metodele, căi cu diacritice, UNC și \\?\
-    └── test_margini.bas cu TestKit: dimensiuni de date și CRC, niveluri de compresie, citire pe bucăți, arhive stricate
+    └── test_margini.bas cu TestKit: dimensiuni de date și CRC, niveluri de compresie, citire pe bucăți, arhive stricate, nume de intrări
 ```
 
 ## Compilare
@@ -97,6 +97,7 @@ Parametrii al căror nume e cuvânt rezervat în FreeBASIC au primit `_`: `len_`
 - Dacă `zip_entry_fwrite` eșuează (de exemplu fișierul nu există), intrarea deschisă rămâne în arhivă, goală, iar codul întors este `ZIP_ENOENT`.
 - Fără parolă, `zip_entry_fread` și `zip_extract` scriu fișierul și abia apoi verifică CRC-ul: la un CRC greșit întorc o eroare, dar fișierul rămâne pe disc. Cu parolă, verificarea se face înainte de scriere și nu rămâne nimic. `ExtractEntry` șterge fișierul nou la eșec (verificat în `test_margini.bas`).
 - Arhivele create cu `'w'` sunt scrise în format zip64 (`zip_is64` = 1).
+- `zip_entry_open` nu ține cont de majuscule; când mai multe intrări se potrivesc (nume duplicate sau care diferă doar prin majuscule), o găsește pe **ultima**, chiar dacă alta are exact numele cerut. `zip_entries_delete` compară numele **cu** majuscule. (Verificate în `test_margini.bas`.)
 
 ## Nivelul 2: clasa ZipArchive
 

@@ -1,6 +1,6 @@
 '' test_margini.bas - marginile legaturii FreeBASIC cu TestKit, dincolo de test_c si test_fb:
 '' dimensiuni de date si CRC calculat independent, niveluri de compresie, citire pe bucati (nivelul 1),
-'' arhive stricate.
+'' arhive stricate, nume de intrari.
 ''
 ''   fbc64 -w all -exx test_margini.bas -i ..\inc -i ..\..\..\TestKit -p out\lib -p ..\bin-win64
 ''   test_margini [--filter=Date.*] [--isolate] [-v]          (libzip.dll langa exe)
@@ -949,6 +949,286 @@ TEST_CASE( Stricate, NuSuntArhive )
     dim as ZipArchive zd
     CHECK_LT( zd.OpenFile(d), 0 )
     CHECK_TRUE( zd.IsOpen = false )
+END_TEST_CASE
+
+'' ================================================================== 5. nume de intrari
+
+'' numele din directorul central, ca octeti, si flag-urile lor (bitul 11 = nume UTF-8)
+sub CentralNames(byref bytes as const string, names() as string, flags() as long)
+    erase names, flags
+    dim as integer n = 0, p = instr(bytes, "PK" & chr(1, 2))
+    while p > 0 andalso p + 45 <= len(bytes)
+        dim as long nl = bytes[p - 1 + 28] or (bytes[p - 1 + 29] shl 8)
+        redim preserve names(0 to n), flags(0 to n)
+        flags(n) = bytes[p - 1 + 8] or (bytes[p - 1 + 9] shl 8)
+        names(n) = mid(bytes, p + 46, nl)
+        n += 1
+        p = instr(p + 46 + nl, bytes, "PK" & chr(1, 2))
+    wend
+end sub
+
+'' arhiva in memorie cu intrarile date (nume, continut = numele in UTF-8)
+function NamedArchive(names() as ustring, byref bytes as string) as long
+    dim as ZipArchive w
+    dim as long e = w.CreateInMemory()
+    if e <> 0 then return e
+    for i as integer = lbound(names) to ubound(names)
+        dim as string content = names(i)
+        e = w.AddBytes(names(i), content)
+        if e <> 0 then return e
+    next
+    return w.ToBytes(bytes)
+end function
+
+dim shared as ustring U_A, U_I, U_S, U_T, U_EMOJI, U_CJK, U_EURO
+U_A = wchr(&h103) : U_I = wchr(&hEE) : U_S = wchr(&h219) : U_T = wchr(&h21B)
+U_EMOJI = wchr(&hD83D, &hDE00)          '' U+1F600, in afara BMP (pereche de surogate in UTF-16)
+U_CJK = wchr(&h6587, &h4EF6)            '' doua caractere CJK
+U_EURO = wchr(&h20AC)
+
+'' numele Unicode (diacritice, CJK, caractere in afara BMP) ies la fel cum au intrat
+TEST_CASE( Nume, Unicode )
+    dim as ustring names(...) = { "rom" & U_A & "n" & U_A & "/" & U_S & U_T & U_I & ".txt", U_CJK & ".txt", _
+        "fata " & U_EMOJI & ".txt", U_EMOJI & U_EMOJI & "/" & U_EURO & U_EMOJI, "ascii.txt" }
+    dim as string bytes
+    REQUIRE_EQ( NamedArchive(names(), bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    REQUIRE_EQ( r.Count, clngint(ubound(names) + 1) )
+    for i as long = 0 to ubound(names)
+        TEST_CONTEXT( "intrarea " & i )
+        dim as string want8 = names(i)
+        dim as ZipEntryInfo info
+        REQUIRE_EQ( r.GetEntry(i, info), 0 )
+        CHECK_EQ( info.Name, names(i) )
+        dim as string got8 = info.Name
+        CHECK_TRUE( got8 = want8 )
+        CHECK_TRUE( r.Contains(names(i)) )
+        dim as string data_
+        CHECK_EQ( r.ReadBytes(names(i), data_), 0 )
+        CHECK_TRUE( data_ = want8 )
+    next
+    '' UTF-8 corect: U+1F600 e F0 9F 98 80, nu doua surogate codate separat (CESU-8)
+    dim as string emoji8 = U_EMOJI
+    CHECK_EQ( emoji8, chr(&hF0, &h9F, &h98, &h80) )
+END_TEST_CASE
+
+'' numele non-ASCII au bitul 11 (UTF-8) in directorul central, ca alte programe sa le citeasca corect
+TEST_CASE( Nume, FlagUtf8 )
+    dim as ustring names(...) = { "ascii.txt", "rom" & U_A & "n" & U_A & ".txt", U_EMOJI & ".txt" }
+    dim as string bytes
+    REQUIRE_EQ( NamedArchive(names(), bytes), 0 )
+    dim as string cn()
+    dim as long fl()
+    CentralNames(bytes, cn(), fl())
+    REQUIRE_EQ( clngint(ubound(cn) + 1), 3ll )
+    for i as long = 0 to 2
+        TEST_CONTEXT( "intrarea " & i )
+        dim as string want8 = names(i)
+        CHECK_TRUE( cn(i) = want8 )
+        if i > 0 then CHECK_MSG( (fl(i) and &h800) <> 0, "flag-uri &h" & hex(fl(i)) & ": lipseste bitul UTF-8" )
+    next
+END_TEST_CASE
+
+'' numele are cel mult 65535 de octeti UTF-8 (campul de 16 biti din antet)
+TEST_CASE( Nume, Lungime )
+    dim as long lens(...) = { 1, 255, 256, 1000, 65534, 65535 }
+    for i as long = 0 to ubound(lens)
+        TEST_CONTEXT( "lungime " & lens(i) )
+        dim as ustring names(0 to 0)
+        names(0) = string(lens(i), "n")
+        dim as string bytes
+        REQUIRE_EQ( NamedArchive(names(), bytes), 0 )
+        dim as ZipArchive r
+        REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+        dim as ZipEntryInfo info
+        REQUIRE_EQ( r.GetEntry(0, info), 0 )
+        CHECK_EQ( clngint(len(info.Name)), clngint(lens(i)) )
+        CHECK_TRUE( r.Contains(names(0)) )
+    next
+    '' 65536 de octeti: refuzat, iar arhiva ramane utilizabila
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    CHECK_EQ( w.AddBytes(string(65536, "n"), "x"), ZIP_EINVENTNAME )
+    '' limita e in octeti: 32767 de "a" (2 octeti fiecare) incap, 32768 nu
+    dim as ustring lungA, preaLungA
+    for k as long = 1 to 32767
+        lungA &= U_A
+    next
+    preaLungA = lungA & U_A
+    CHECK_EQ( w.AddBytes(lungA, "x"), 0 )
+    CHECK_EQ( w.AddBytes(preaLungA, "x"), ZIP_EINVENTNAME )
+    CHECK_EQ( w.AddBytes("dupa.txt", "y"), 0 )
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    CHECK_EQ( r.Count, 2 )
+    CHECK_TRUE( r.Contains(lungA) )
+    CHECK_TRUE( r.Contains("dupa.txt") )
+END_TEST_CASE
+
+'' "\" se scrie ca "/"; cautarea cu "\" gaseste aceeasi intrare
+TEST_CASE( Nume, Backslash )
+    dim as ustring names(...) = { "x\y.txt", "a\b\c.txt" }
+    dim as string bytes
+    REQUIRE_EQ( NamedArchive(names(), bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    dim as ZipEntryInfo info
+    REQUIRE_EQ( r.GetEntry(0, info), 0 )
+    dim as ustring w0 = "x/y.txt"
+    CHECK_EQ( info.Name, w0 )
+    CHECK_TRUE( r.Contains("x/y.txt") )
+    CHECK_TRUE( r.Contains("a/b/c.txt") )
+    CHECK_TRUE( r.Contains("x\y.txt") )
+    CHECK_TRUE( r.Contains("a\b\c.txt") )
+    dim as string got
+    CHECK_EQ( r.ReadBytes("a\b\c.txt", got), 0 )
+    '' stergerea cu "\" sterge intrarea scrisa cu "/"
+    dim as ZipArchive dz
+    REQUIRE_EQ( dz.OpenMemory(bytes, ZipDelete), 0 )
+    dim as ustring del(0 to 0)
+    del(0) = "a\b\c.txt"
+    CHECK_EQ( dz.DeleteEntries(del()), 1 )
+    dim as string after
+    REQUIRE_EQ( dz.ToBytes(after), 0 )
+    dim as ZipArchive ra
+    REQUIRE_EQ( ra.OpenMemory(after), 0 )
+    CHECK_EQ( ra.Count, 1 )
+    CHECK_TRUE( ra.Contains("x/y.txt") )
+END_TEST_CASE
+
+'' nume care difera doar prin majuscule: cautarea normala gaseste ultima, cea exacta (nivelul 1) pe fiecare
+TEST_CASE( Nume, Majuscule )
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    REQUIRE_EQ( w.AddBytes("Mare.txt", "1"), 0 )
+    REQUIRE_EQ( w.AddBytes("mare.txt", "2"), 0 )
+    REQUIRE_EQ( w.AddBytes("MARE.TXT", "3"), 0 )
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    CHECK_EQ( r.Count, 3 )
+    dim as string got
+    '' la mai multe potriviri, cautarea fara majuscule gaseste ultima intrare (ca la Duplicate);
+    '' numele scris exact nu are prioritate
+    CHECK_EQ( r.ReadBytes("mArE.tXt", got), 0 )
+    CHECK_EQ( got, "3" )
+    CHECK_EQ( r.ReadBytes("mare.txt", got), 0 )
+    TestLog( "ReadBytes(""mare.txt"") gaseste: " & got )
+    dim as zip_t ptr z = zip_stream_open(strptr(bytes), len(bytes), 0, asc("r"))
+    REQUIRE_TRUE( z <> 0 )
+    dim as string exact(...) = { "Mare.txt", "mare.txt", "MARE.TXT" }
+    for i as long = 0 to 2
+        TEST_CONTEXT( exact(i) )
+        CHECK_EQ( zip_entry_opencasesensitive(z, exact(i)), 0 )
+        CHECK_EQ( zip_entry_index(z), clngint(i) )
+        zip_entry_close(z)
+    next
+    CHECK_EQ( zip_entry_opencasesensitive(z, "mArE.tXt"), ZIP_ENOENT )
+    zip_stream_close(z)
+    '' stergerea tine cont de majuscule: sterge doar numele scris exact
+    dim as ZipArchive dz
+    REQUIRE_EQ( dz.OpenMemory(bytes, ZipDelete), 0 )
+    dim as ustring del(0 to 0)
+    del(0) = "mArE.tXt"
+    CHECK_EQ( dz.DeleteEntries(del()), 0 )
+    del(0) = "mare.txt"
+    CHECK_EQ( dz.DeleteEntries(del()), 1 )
+    dim as string after
+    REQUIRE_EQ( dz.ToBytes(after), 0 )
+    dim as ZipArchive ra
+    REQUIRE_EQ( ra.OpenMemory(after), 0 )
+    CHECK_EQ( ra.Count, 2 )
+END_TEST_CASE
+
+'' acelasi nume de doua ori: ambele intrari exista, cautarea o gaseste pe ultima
+TEST_CASE( Nume, Duplicate )
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    REQUIRE_EQ( w.AddBytes("dublu.txt", "primul"), 0 )
+    dim as long e2 = w.AddBytes("dublu.txt", "al doilea")
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    TestLog( "a doua adaugare: " & e2 & ", intrari: " & r.Count )
+    if e2 = 0 then
+        CHECK_EQ( r.Count, 2 )
+        dim as string a, b, f
+        CHECK_EQ( r.ReadBytesAt(0, a), 0 )
+        CHECK_EQ( r.ReadBytesAt(1, b), 0 )
+        CHECK_EQ( a, "primul" )
+        CHECK_EQ( b, "al doilea" )
+        CHECK_EQ( r.ReadBytes("dublu.txt", f), 0 )
+        '' ultima intrare cu acel nume, ca la dezarhivatoarele obisnuite
+        CHECK_EQ( f, b )
+        TestLog( "ReadBytes gaseste: " & f )
+    else
+        CHECK_EQ( r.Count, 1 )
+    end if
+END_TEST_CASE
+
+'' directoare: "d", "d/" si "x\y" dau o singura bara la sfarsit
+TEST_CASE( Nume, Directoare )
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    REQUIRE_EQ( w.AddDirectory("d"), 0 )
+    REQUIRE_EQ( w.AddDirectory("e/"), 0 )
+    REQUIRE_EQ( w.AddDirectory("x\y"), 0 )
+    REQUIRE_EQ( w.AddDirectory("p\q\"), 0 )
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    dim as ustring want(...) = { "d/", "e/", "x/y/", "p/q/" }
+    REQUIRE_EQ( r.Count, 4 )
+    for i as long = 0 to 3
+        TEST_CONTEXT( want(i) )
+        dim as ZipEntryInfo info
+        REQUIRE_EQ( r.GetEntry(i, info), 0 )
+        CHECK_EQ( info.Name, want(i) )
+        CHECK_TRUE( info.IsDirectory )
+    next
+END_TEST_CASE
+
+'' nume neobisnuite, dar scrise in arhiva: se citesc inapoi exact (extragerea lor e la grupul 6)
+TEST_CASE( Nume, Neobisnuite )
+    dim as ustring names(...) = { " spatiu la capete ", "tab" & chr(9) & ".txt", "ctrl" & chr(1) & ".txt", _
+        "a:b.txt", "stea*?<>|.txt", "/radacina.txt", "C:\disc.txt", "..", ".", "...", "punct.", "a//b.txt" }
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    dim as long added = 0
+    for i as long = 0 to ubound(names)
+        TEST_CONTEXT( "nume " & i )
+        dim as string content = names(i)
+        dim as long e = w.AddBytes(names(i), content)
+        CHECK_MSG( e = 0 orelse e = ZIP_EINVENTNAME, "AddBytes: " & e )
+        if e = 0 then added += 1 else TestLog( "refuzat: nume " & i )
+    next
+    CHECK_EQ( w.AddBytes("", "x"), ZIP_EINVENTNAME )
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    CHECK_EQ( r.Count, clngint(added) )
+    for i as long = 0 to r.Count - 1
+        TEST_CONTEXT( "intrarea " & i )
+        dim as ZipEntryInfo info
+        REQUIRE_EQ( r.GetEntry(i, info), 0 )
+        dim as string got, name8 = info.Name
+        if info.IsDirectory = false then
+            CHECK_EQ( r.ReadBytesAt(i, got), 0 )
+            '' continutul e numele original; "\" a devenit "/" in nume
+            dim as string slashed = got
+            for k as integer = 0 to len(slashed) - 1
+                if slashed[k] = asc("\") then slashed[k] = asc("/")
+            next
+            CHECK_EQ( name8, slashed )
+        end if
+    next
 END_TEST_CASE
 
 end TestKitMain( )
