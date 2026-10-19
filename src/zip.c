@@ -54,6 +54,15 @@
 #define fileno _fileno
 #endif
 
+#ifdef __MINGW32__
+#include <io.h>
+
+// MinGW's ftruncate takes a 32-bit off_t, so zip_close cut a finalized
+// archive past 4 GB down to its size modulo 2^32; _chsize_s takes 64 bits
+#undef ftruncate
+#define ftruncate(fd, sz) (-(_chsize_s((fd), (sz)) != 0))
+#endif
+
 #ifndef HAS_DEVICE
 #define HAS_DEVICE(P) 0
 #endif
@@ -2068,6 +2077,14 @@ static int _zip_entry_open(struct zip_t *zip, const char *entryname,
 #ifndef MINIZ_NO_TIME
   mz_zip_time_t_to_dos_time(zip->entry.m_time, &dos_time, &dos_date);
 #endif
+
+  // a local header past 4 GB keeps its offset only in the zip64 extra field,
+  // which a classic central directory refuses (MZ_ZIP_FILE_TOO_LARGE, so
+  // zip_entry_close failed with ZIP_EWRTDIR). Like miniz's mz_zip_writer_add_*,
+  // switch the archive to zip64 here.
+  if (!pzip->m_pState->m_zip64 && local_dir_header_ofs >= MZ_UINT32_MAX) {
+    pzip->m_pState->m_zip64 = MZ_TRUE;
+  }
 
   // ZIP64 header with NULL sizes (sizes will be in the data descriptor, just
   // after file data)
