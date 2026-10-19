@@ -940,8 +940,27 @@ out:
 
 #if ZIP_ENABLE_DEFLATE
 
+// zip.c writes the entry headers itself instead of going through miniz's
+// mz_zip_writer_add_*, which switch an archive to zip64 once it outgrows the
+// classic end of central directory (65535 entries, 4 GB). Without that switch
+// mz_zip_writer_finalize_archive refuses with MZ_ZIP_TOO_MANY_FILES, and
+// zip_close cannot report it: an appended archive was left with its old
+// central directory overwritten and a new one never written. The entry
+// headers already carry zip64 extra fields where a value needs them.
+static mz_bool zip_writer_finalize(mz_zip_archive *pzip) {
+  mz_zip_internal_state *pState = pzip->m_pState;
+  if (pState && !pState->m_zip64 &&
+      (pzip->m_total_files > MZ_UINT16_MAX ||
+       pzip->m_archive_size + pState->m_central_dir.m_size +
+               MZ_ZIP_END_OF_CENTRAL_DIR_HEADER_SIZE >
+           MZ_UINT32_MAX)) {
+    pState->m_zip64 = MZ_TRUE;
+  }
+  return mz_zip_writer_finalize_archive(pzip);
+}
+
 static inline void zip_archive_finalize(mz_zip_archive *pzip) {
-  mz_zip_writer_finalize_archive(pzip);
+  zip_writer_finalize(pzip);
   zip_archive_truncate(pzip);
 }
 
@@ -1847,7 +1866,7 @@ void zip_close(struct zip_t *zip) {
     mz_zip_archive *pZip = &(zip->archive);
 #if ZIP_ENABLE_DEFLATE
     if (pZip->m_zip_mode == MZ_ZIP_MODE_WRITING) {
-      mz_zip_writer_finalize_archive(pZip);
+      zip_writer_finalize(pZip);
     }
 
     if (pZip->m_zip_mode == MZ_ZIP_MODE_WRITING ||
