@@ -1,6 +1,6 @@
 '' test_margini.bas - marginile legaturii FreeBASIC cu TestKit, dincolo de test_c si test_fb:
 '' dimensiuni de date si CRC calculat independent, niveluri de compresie, citire pe bucati (nivelul 1),
-'' arhive stricate, nume de intrari, extragere periculoasa.
+'' arhive stricate, nume de intrari, extragere periculoasa, volum si zip64.
 ''
 ''   fbc64 -w all -exx test_margini.bas -i ..\inc -i ..\..\..\TestKit -p out\lib -p ..\bin-win64
 ''   test_margini [--filter=Date.*] [--isolate] [-v]          (libzip.dll langa exe)
@@ -10,6 +10,7 @@
 #include once "zipfb.bi"
 #include once "windows.bi"
 #include once "crt/string.bi"
+#include once "win/psapi.bi"
 #include once "TestKit.bi"
 
 '' ================================================================== ajutoare
@@ -1450,6 +1451,248 @@ TEST_CASE( Extragere, CaleLunga )
         CHECK_TRUE( ReadAll(full) = want )
     end if
     CHECK_EQ( Escaped(dest), "" )
+END_TEST_CASE
+
+'' ================================================================== 7. volum si zip64
+'' Peste 65535 de intrari, campurile de 16 biti ale directorului central nu mai ajung: arhiva are
+'' nevoie de sfarsitul zip64. Biblioteca scrie zip64 la "w"; modul nedocumentat "w" - 64 scrie fara.
+
+const MANY = 70000
+
+function ManyName(byval i as long) as string
+    return "f/" & i & ".txt"
+end function
+
+function AddMany(byref w as ZipArchive, byval first as long, byval last as long) as long
+    for i as long = first to last
+        dim as long e = w.AddBytes(ManyName(i), str(i))
+        if e <> 0 then return e
+    next
+    return 0
+end function
+
+'' toate numele in ordine (o singura trecere), plus continutul cate unei intrari de la capete si
+'' de la granita de 65536
+sub CheckMany(byref r as ZipArchive, byval n as long)
+    REQUIRE_EQ( r.Count, clngint(n) )
+    dim as ZipEntryInfo entries()
+    REQUIRE_EQ( r.ListEntries(entries()), clngint(n) )
+    dim as long wrong = 0, firstWrong = -1
+    for i as long = 0 to n - 1
+        dim as ustring want = ManyName(i)
+        if entries(i).Name <> want then
+            wrong += 1
+            if firstWrong < 0 then firstWrong = i
+        end if
+    next
+    CHECK_MSG( wrong = 0, wrong & " nume gresite, primul la " & firstWrong )
+    dim as long probes(...) = { 0, 1, 65534, 65535, 65536, 65537, n - 1 }
+    for k as long = 0 to ubound(probes)
+        if probes(k) >= n then continue for
+        TEST_CONTEXT( "index " & probes(k) )
+        dim as string got
+        CHECK_EQ( r.ReadBytesAt(probes(k), got), 0 )
+        CHECK_EQ( got, str(probes(k)) )
+    next
+    dim as string got
+    CHECK_EQ( r.ReadBytes(ManyName(n - 1), got), 0 )
+    CHECK_EQ( got, str(n - 1) )
+end sub
+
+TEST_CASE( Volum, Peste65535InMemorie )
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    REQUIRE_EQ( AddMany(w, 0, MANY - 1), 0 )
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenMemory(bytes), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    CheckMany(r, MANY)
+END_TEST_CASE
+
+TEST_CASE( Volum, Peste65535InFisier )
+    dim as ustring p = WorkDir() & "\multe.zip"
+    dim as ZipArchive w
+    REQUIRE_EQ( w.OpenFile(p, ZipWrite), 0 )
+    REQUIRE_EQ( AddMany(w, 0, MANY - 1), 0 )
+    w.Close()
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    CheckMany(r, MANY)
+    r.Close()
+    dim as string p8 = p
+    dim as zip_t ptr z = zip_open(strptr(p8), 0, asc("r"))
+    REQUIRE_TRUE( z <> 0 )
+    CHECK_EQ( zip_entries_total(z), clngint(MANY) )
+    zip_close(z)
+END_TEST_CASE
+
+'' stergerea a jumatate din intrari (dupa index), apoi a catorva dupa nume, apoi a tuturor
+TEST_CASE( Volum, StergereMulta )
+    dim as ustring p = WorkDir() & "\sterse.zip"
+    dim as ZipArchive w
+    REQUIRE_EQ( w.OpenFile(p, ZipWrite), 0 )
+    REQUIRE_EQ( AddMany(w, 0, MANY - 1), 0 )
+    w.Close()
+
+    dim as ZipArchive dz
+    REQUIRE_EQ( dz.OpenFile(p, ZipDelete), 0 )
+    dim as integer idx(0 to MANY \ 2 - 1)
+    for i as long = 0 to MANY \ 2 - 1
+        idx(i) = i * 2
+    next
+    CHECK_EQ( dz.DeleteEntriesAt(idx()), clngint(MANY \ 2) )
+    dz.Close()
+
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p), 0 )
+    REQUIRE_EQ( r.Count, clngint(MANY \ 2) )
+    dim as ZipEntryInfo entries()
+    REQUIRE_EQ( r.ListEntries(entries()), clngint(MANY \ 2) )
+    dim as long wrong = 0
+    for i as long = 0 to MANY \ 2 - 1
+        dim as ustring want = ManyName(i * 2 + 1)
+        if entries(i).Name <> want then wrong += 1
+    next
+    CHECK_MSG( wrong = 0, wrong & " intrari ramase gresite" )
+    dim as string got
+    CHECK_EQ( r.ReadBytesAt(MANY \ 2 - 1, got), 0 )
+    CHECK_EQ( got, str(MANY - 1) )
+    r.Close()
+
+    '' cateva dupa nume
+    REQUIRE_EQ( dz.OpenFile(p, ZipDelete), 0 )
+    dim as ustring names(0 to 99)
+    for i as long = 0 to 99
+        names(i) = ManyName(i * 2 + 1)
+    next
+    CHECK_EQ( dz.DeleteEntries(names()), 100 )
+    dz.Close()
+    REQUIRE_EQ( r.OpenFile(p), 0 )
+    CHECK_EQ( r.Count, clngint(MANY \ 2 - 100) )
+    CHECK_TRUE( r.Contains(ManyName(201)) )
+    CHECK_TRUE( r.Contains(ManyName(199)) = false )
+    dim as long remaining = r.Count
+    r.Close()
+
+    '' toate
+    REQUIRE_EQ( dz.OpenFile(p, ZipDelete), 0 )
+    dim as integer all_(0 to remaining - 1)
+    for i as long = 0 to remaining - 1
+        all_(i) = i
+    next
+    CHECK_EQ( dz.DeleteEntriesAt(all_()), clngint(remaining) )
+    dz.Close()
+    REQUIRE_EQ( r.OpenFile(p), 0 )
+    CHECK_EQ( r.Count, 0 )
+END_TEST_CASE
+
+'' o arhiva fara zip64 ajunge peste 65535 de intrari, prin adaugare sau scrisa direct: la inchidere
+'' trece pe zip64 (inainte, finalizarea esua in tacere si arhiva adaugata era distrusa)
+TEST_CASE( Volum, FaraZip64PesteLimita )
+    dim as ustring d = WorkDir()
+    dim as string p8 = d & "\clasic.zip"
+    dim as zip_t ptr z = zip_open(strptr(p8), ZIP_DEFAULT_COMPRESSION_LEVEL, asc("w") - 64)
+    REQUIRE_TRUE( z <> 0 )
+    for i as long = 0 to 65533
+        dim as string n8 = ManyName(i), c = str(i)
+        if zip_entry_open(z, strptr(n8)) <> 0 then exit for
+        zip_entry_write(z, strptr(c), len(c))
+        zip_entry_close(z)
+    next
+    zip_close(z)
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p8), 0 )
+    CHECK_EQ( r.Count, 65534 )
+    CHECK_TRUE( r.IsZip64() = false )
+    r.Close()
+
+    '' adaugare peste 65535
+    dim as ZipArchive a
+    REQUIRE_EQ( a.OpenFile(p8, ZipAppend), 0 )
+    dim as long eAdd = AddMany(a, 65534, 65539)
+    a.Close()
+    CHECK_EQ( eAdd, 0 )
+    REQUIRE_EQ( r.OpenFile(p8), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    CheckMany(r, 65540)
+    r.Close()
+
+    '' scrisa direct fara zip64, cu 65540 de intrari
+    dim as string q8 = d & "\clasic2.zip"
+    z = zip_open(strptr(q8), ZIP_DEFAULT_COMPRESSION_LEVEL, asc("w") - 64)
+    REQUIRE_TRUE( z <> 0 )
+    dim as long written = 0, eWrite = 0
+    for i as long = 0 to 65539
+        dim as string n8 = ManyName(i), c = str(i)
+        eWrite = zip_entry_open(z, strptr(n8))
+        if eWrite <> 0 then exit for
+        zip_entry_write(z, strptr(c), len(c))
+        eWrite = zip_entry_close(z)
+        if eWrite <> 0 then exit for
+        written += 1
+    next
+    zip_close(z)
+    CHECK_EQ( written, 65540 )
+    CHECK_EQ( eWrite, 0 )
+    REQUIRE_EQ( r.OpenFile(q8), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    CheckMany(r, 65540)
+END_TEST_CASE
+
+function PrivateBytes() as longint
+    dim as PROCESS_MEMORY_COUNTERS_EX pmc
+    pmc.cb = sizeof(pmc)
+    GetProcessMemoryInfo(GetCurrentProcess(), cast(PPROCESS_MEMORY_COUNTERS, @pmc), sizeof(pmc))
+    return pmc.PrivateUsage
+end function
+
+'' mii de deschideri, citiri si inchideri nu fac memoria procesului sa creasca
+TEST_CASE( Volum, DeschideriRepetate )
+    dim as ustring p = WorkDir() & "\repetat.zip"
+    dim as string txt = MakeData(100000, KindText)
+    dim as ZipArchive w
+    REQUIRE_EQ( w.OpenFile(p, ZipWrite, 6, ""), 0 )
+    REQUIRE_EQ( w.AddBytes("a.txt", txt), 0 )
+    w.Close()
+    dim as string bytes = ReadAll(p)
+    dim as string p8 = p
+
+    '' o runda de incalzire, apoi masurarea
+    dim as longint before
+    for round as long = 0 to 1
+        if round = 1 then before = PrivateBytes()
+        for i as long = 1 to iif(round = 0, 50, 2000)
+            dim as ZipArchive r
+            dim as string got
+            if r.OpenMemory(bytes) <> 0 orelse r.ReadBytes("a.txt", got) <> 0 then TEST_FAIL( "memorie, ciclul " & i )
+            r.Close()
+            if r.OpenFile(p) <> 0 orelse r.ReadBytes("a.txt", got) <> 0 then TEST_FAIL( "fisier, ciclul " & i )
+            r.Close()
+            dim as ZipArchive m
+            dim as string out_
+            if m.CreateInMemory() <> 0 orelse m.AddBytes("x", txt) <> 0 orelse m.ToBytes(out_) <> 0 then TEST_FAIL( "creare, ciclul " & i )
+            m.Close()
+            dim as zip_t ptr z = zip_open(strptr(p8), 0, asc("r"))
+            if z = 0 then TEST_FAIL( "nivelul 1, ciclul " & i )
+            zip_entry_open(z, "a.txt")
+            dim as any ptr buf = 0
+            dim as uinteger size = 0
+            zip_entry_read(z, @buf, @size)
+            deallocate(buf)
+            zip_entry_close(z)
+            zip_close(z)
+            '' intrare deschisa si neinchisa inainte de zip_close
+            z = zip_open(strptr(p8), 0, asc("r"))
+            zip_entry_open(z, "a.txt")
+            zip_close(z)
+        next
+    next
+    dim as longint grown = PrivateBytes() - before
+    TestLog( "memoria privata a crescut cu " & grown \ 1024 & " KB in 2000 de cicluri" )
+    CHECK_MSG( grown < 16 * 1024 * 1024, "memoria a crescut cu " & grown \ 1024 & " KB" )
 END_TEST_CASE
 
 end TestKitMain( )

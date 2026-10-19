@@ -26,7 +26,7 @@ freebasic/
     ├── run_tests.cmd    compilează și rulează testele și exemplele
     ├── test_c.bas       nivelul 1: fiecare grup de funcții din zip.h
     ├── test_fb.bas      nivelul 2: toate metodele, căi cu diacritice, UNC și \\?\
-    └── test_margini.bas cu TestKit: dimensiuni de date și CRC, niveluri de compresie, citire pe bucăți, arhive stricate, nume de intrări, extragere periculoasă
+    └── test_margini.bas cu TestKit: dimensiuni de date și CRC, niveluri de compresie, citire pe bucăți, arhive stricate, nume de intrări, extragere periculoasă, volum și zip64
 ```
 
 ## Compilare
