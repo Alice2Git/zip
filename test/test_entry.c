@@ -424,6 +424,71 @@ MU_TEST(test_entries_deletefirst_then_add) {
   UNLINK(name);
 }
 
+MU_TEST(test_entry_open_backslash) {
+  // writing stores "test\\test-2.txt" as "test/test-2.txt"; reading with the
+  // same '\' name used to give ZIP_ENOENT
+  char *buf = NULL;
+  size_t bufsize = 0;
+  struct zip_t *zip = zip_open(ZIPNAME, 0, 'r');
+  mu_check(zip != NULL);
+
+  mu_assert_int_eq(0, zip_entry_open(zip, "test\\test-2.txt"));
+  mu_assert_int_eq(strlen(TESTDATA2),
+                   (int)zip_entry_read(zip, (void **)&buf, &bufsize));
+  mu_assert_int_eq(0, strncmp(buf, TESTDATA2, bufsize));
+  mu_assert_int_eq(CRC32DATA2, zip_entry_crc32(zip));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  free(buf);
+
+  mu_assert_int_eq(0, zip_entry_opencasesensitive(zip, "test\\test-2.txt"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  mu_assert_int_eq(ZIP_ENOENT,
+                   zip_entry_opencasesensitive(zip, "TEST\\test-2.txt"));
+  mu_assert_int_eq(0, zip_entry_open(zip, "TEST\\test-2.txt"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+
+  zip_close(zip);
+}
+
+MU_TEST(test_entries_delete_backslash) {
+  // zip_entries_delete compared names with strcmp, so "a\\b.txt" did not
+  // delete the entry that writing stored as "a/b.txt"
+  const char *names[] = {"a\\b.txt", "c/d.txt", "e.txt"};
+  struct zip_t *zw =
+      zip_stream_open(NULL, 0, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+  mu_check(zw != NULL);
+  for (size_t i = 0; i < 3; ++i) {
+    mu_assert_int_eq(0, zip_entry_open(zw, names[i]));
+    mu_assert_int_eq(0, zip_entry_write(zw, TESTDATA1, strlen(TESTDATA1)));
+    mu_assert_int_eq(0, zip_entry_close(zw));
+  }
+  void *zdata = NULL;
+  size_t zsize = 0;
+  mu_check(zip_stream_copy(zw, &zdata, &zsize) > 0);
+  zip_stream_close(zw);
+
+  struct zip_t *zip = zip_stream_open((const char *)zdata, zsize,
+                                      ZIP_DEFAULT_COMPRESSION_LEVEL, 'd');
+  mu_check(zip != NULL);
+  char *del[] = {"a\\b.txt", "c\\d.txt"};
+  mu_assert_int_eq(2, zip_entries_delete(zip, del, 2));
+  void *outdata = NULL;
+  size_t outsize = 0;
+  mu_check(zip_stream_copy(zip, &outdata, &outsize) > 0);
+  zip_stream_close(zip);
+  free(zdata);
+
+  zip = zip_stream_open((const char *)outdata, outsize, 0, 'r');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(1, zip_entries_total(zip));
+  mu_assert_int_eq(ZIP_ENOENT, zip_entry_open(zip, "a/b.txt"));
+  mu_assert_int_eq(ZIP_ENOENT, zip_entry_open(zip, "c/d.txt"));
+  mu_assert_int_eq(0, zip_entry_open(zip, "e.txt"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  zip_stream_close(zip);
+  free(outdata);
+}
+
 MU_TEST(test_entries_delete_add_delete) {
   // delete an entry, add a new one, then delete the added entry in the same
   // session. the add appends the new central-dir offset at the offsets array's
@@ -1738,6 +1803,8 @@ MU_TEST_SUITE(test_entry_suite) {
 
   MU_RUN_TEST(test_entry_name);
   MU_RUN_TEST(test_entry_opencasesensitive);
+  MU_RUN_TEST(test_entry_open_backslash);
+  MU_RUN_TEST(test_entries_delete_backslash);
   MU_RUN_TEST(test_entry_index);
   MU_RUN_TEST(test_entry_openbyindex);
   MU_RUN_TEST(test_entry_read);

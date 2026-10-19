@@ -496,7 +496,7 @@ static char *zip_strclone(const char *str, size_t n) {
   return begin;
 }
 
-#if ZIP_ENABLE_DEFLATE
+// also used by the reader: a name looked up with '\' is retried with '/'
 static char *zip_strrpl(const char *str, size_t n, char oldchar, char newchar) {
   char c;
   size_t i;
@@ -515,7 +515,6 @@ static char *zip_strrpl(const char *str, size_t n, char oldchar, char newchar) {
 
   return begin;
 }
-#endif /* ZIP_ENABLE_DEFLATE */
 
 #if ZIP_ENABLE_INFLATE
 #ifndef MINIZ_NO_STDIO
@@ -884,6 +883,17 @@ static inline void zip_archive_finalize(mz_zip_archive *pzip) {
   zip_archive_truncate(pzip);
 }
 
+// a name given for deletion matches the stored one exactly, or with '\' where
+// the stored name has '/', since writing stores '\' as '/'
+static int zip_name_matches(const char *stored, const char *given) {
+  for (; *stored && *given; ++stored, ++given) {
+    if (*stored != *given && !(*given == '\\' && *stored == '/')) {
+      return 0;
+    }
+  }
+  return *stored == *given;
+}
+
 static ssize_t zip_entry_mark(struct zip_t *zip,
                               struct zip_entry_mark_t *entry_mark,
                               const size_t n, char *const entries[],
@@ -905,7 +915,7 @@ static ssize_t zip_entry_mark(struct zip_t *zip,
     {
       size_t j;
       for (j = 0; j < len; ++j) {
-        if (strcmp(zip->entry.name, entries[j]) == 0) {
+        if (zip_name_matches(zip->entry.name, entries[j])) {
           name_matches = MZ_TRUE;
           break;
         }
@@ -1865,6 +1875,17 @@ static int _zip_entry_open(struct zip_t *zip, const char *entryname,
     zip->entry.index = (ssize_t)mz_zip_reader_locate_file(
         pzip, zip->entry.name, NULL,
         case_sensitive ? MZ_ZIP_FLAG_CASE_SENSITIVE : 0);
+    // writing stores '\' as '/', so look a name with '\' up again with '/';
+    // the exact name is tried first for archives that store '\' themselves
+    if (zip->entry.index < (ssize_t)0 && strchr(zip->entry.name, '\\')) {
+      char *slashed = zip_strrpl(entryname, entrylen, '\\', '/');
+      if (slashed) {
+        zip->entry.index = (ssize_t)mz_zip_reader_locate_file(
+            pzip, slashed, NULL,
+            case_sensitive ? MZ_ZIP_FLAG_CASE_SENSITIVE : 0);
+        free(slashed);
+      }
+    }
     if (zip->entry.index < (ssize_t)0) {
       CLEANUP(zip->entry.name);
       return ZIP_ENOENT;
