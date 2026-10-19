@@ -425,6 +425,58 @@ MU_TEST(test_noallocread_dir_entry_rejected) {
   zip_stream_close(zip);
 }
 
+static size_t on_extract_count(void *arg, uint64_t offset, const void *data,
+                               size_t size) {
+  (void)offset;
+  (void)data;
+  ++*(int *)arg;
+  return size;
+}
+
+MU_TEST(test_extract_dir_entry_rejected) {
+  // zip_entry_extract returned 0 for a directory entry (and, with a password,
+  // called on_extract once with zero bytes) while zip_entry_read,
+  // zip_entry_noallocread and zip_entry_fread reject it with ZIP_EINVENTTYPE.
+  char pwname[L_tmpnam + 1] = {0};
+  int calls = 0;
+  struct zip_t *zip = zip_open(ZIPNAME, 0, 'r');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(0, zip_entry_open(zip, "empty/"));
+  mu_assert_int_eq(1, zip_entry_isdir(zip));
+  mu_assert_int_eq(ZIP_EINVENTTYPE,
+                   zip_entry_extract(zip, on_extract_count, &calls));
+  mu_assert_int_eq(0, calls);
+  mu_assert_int_eq(0, zip_entry_close(zip));
+
+  // a regular entry still extracts
+  mu_assert_int_eq(0, zip_entry_open(zip, "test/test-1.txt"));
+  mu_assert_int_eq(0, zip_entry_extract(zip, on_extract_count, &calls));
+  mu_check(calls > 0);
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  zip_close(zip);
+
+  // the password branch decrypts the entry before calling on_extract
+  strncpy(pwname, "p-XXXXXX\0", L_tmpnam);
+  MKTEMP(pwname);
+  zip = zip_open_with_password(pwname, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w',
+                               "secret");
+  mu_check(zip != NULL);
+  mu_assert_int_eq(0, zip_entry_open(zip, "dir/"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  zip_close(zip);
+
+  zip = zip_open_with_password(pwname, 0, 'r', "secret");
+  mu_check(zip != NULL);
+  calls = 0;
+  mu_assert_int_eq(0, zip_entry_open(zip, "dir/"));
+  mu_assert_int_eq(ZIP_EINVENTTYPE,
+                   zip_entry_extract(zip, on_extract_count, &calls));
+  mu_assert_int_eq(0, calls);
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  zip_close(zip);
+  remove(pwname);
+}
+
 MU_TEST_SUITE(test_read_suite) {
   MU_SUITE_CONFIGURE(&test_setup, &test_teardown);
 
@@ -434,6 +486,7 @@ MU_TEST_SUITE(test_read_suite) {
   MU_RUN_TEST(test_noallocreadwithoffset_corrupt);
   MU_RUN_TEST(test_noallocreadwithoffset_hugesize);
   MU_RUN_TEST(test_noallocread_dir_entry_rejected);
+  MU_RUN_TEST(test_extract_dir_entry_rejected);
   MU_RUN_TEST(test_open_zero_comp_size_rejected);
 }
 

@@ -171,3 +171,4 @@ Testele de pe Windows cu msvcrt (runtime-ul FreeBASIC) au găsit probleme în bi
 
 - `fdfdb5d`, `078851e`: `zip_extract` și `zip_stream_extract` eșuau cu `ZIP_ENOFILE` pentru orice destinație, pentru că `_wstat` din msvcrt respinge un director cu separator la final. Rădăcina unui share (`\\server\share\`) își păstrează separatorul.
 - `46bc5aa`: căile `\\?\` (`fwrite`, `zip_create`, extragere), plus `chmod`/`utime`/`remove` cu nume non-ASCII. Acestea treceau prin funcțiile înguste ale CRT, deci extragerea unei arhive cu atribute Unix eșua cu `ZIP_ENOPERM`, iar fișierele își pierdeau data.
+- `zip_entry_extract` pe o intrare director întorcea 0 (cu parolă chema și apelul invers o dată, cu 0 octeți), în timp ce `zip_entry_read`, `zip_entry_noallocread` și `zip_entry_fread` o refuză. Acum întoarce și el `ZIP_EINVENTTYPE`, fără să cheme apelul invers. Găsit de `test_margini.bas`; testul C este `test_extract_dir_entry_rejected` din `test/test_read.c`.

@@ -3010,6 +3010,13 @@ int zip_entry_extract(struct zip_t *zip,
 
   idx = (mz_uint)zip->entry.index;
 
+  // a directory entry carries no data: reject it as zip_entry_read,
+  // zip_entry_noallocread and zip_entry_fread do, instead of returning success
+  // (and, with a password, calling on_extract once with zero bytes)
+  if (mz_zip_reader_is_file_a_directory(pzip, idx)) {
+    return ZIP_EINVENTTYPE;
+  }
+
   if (zip->password) {
     void *heap_buf = NULL;
     size_t heap_size = 0;
