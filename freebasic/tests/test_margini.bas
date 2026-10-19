@@ -1,6 +1,6 @@
 '' test_margini.bas - marginile legaturii FreeBASIC cu TestKit, dincolo de test_c si test_fb:
 '' dimensiuni de date si CRC calculat independent, niveluri de compresie, citire pe bucati (nivelul 1),
-'' arhive stricate, nume de intrari.
+'' arhive stricate, nume de intrari, extragere periculoasa.
 ''
 ''   fbc64 -w all -exx test_margini.bas -i ..\inc -i ..\..\..\TestKit -p out\lib -p ..\bin-win64
 ''   test_margini [--filter=Date.*] [--isolate] [-v]          (libzip.dll langa exe)
@@ -1229,6 +1229,227 @@ TEST_CASE( Nume, Neobisnuite )
             CHECK_EQ( name8, slashed )
         end if
     next
+END_TEST_CASE
+
+'' ================================================================== 6. extragere periculoasa
+'' Destinatia sta in <lucru>\cutie\d1\d2. Regula: extragerea nu scrie nimic in afara destinatiei, iar
+'' o intrare fie da eroare, fie devine un fisier vizibil in destinatie, cu datele ei. Biblioteca se
+'' opreste la prima eroare, deci fiecare nume riscant are arhiva lui.
+
+'' toate fisierele de sub dir_ (cai complete), recursiv
+sub ListFiles(byref dir_ as const ustring, files() as ustring)
+    dim as WIN32_FIND_DATAW fd
+    dim as HANDLE h = FindFirstFileW(dir_ & "\*", @fd)
+    if h = INVALID_HANDLE_VALUE then exit sub
+    do
+        dim as ustring n = fd.cFileName
+        if n <> "." andalso n <> ".." then
+            dim as ustring full = dir_ & "\" & n
+            if fd.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY then
+                ListFiles(full, files())
+            else
+                dim as integer k = ubound(files) + 1
+                redim preserve files(0 to k)
+                files(k) = full
+            end if
+        end if
+    loop while FindNextFileW(h, @fd)
+    FindClose(h)
+end sub
+
+'' o cutie goala cu destinatia in ea; intoarce destinatia
+function SandboxDest(byref work as const ustring, byref tag as const string) as ustring
+    dim as ustring box = work & "\cutie_" & tag
+    CreateDirectoryW(box, 0)
+    ClearDir(box)
+    CreateDirectoryW(box & "\d1", 0)
+    CreateDirectoryW(box & "\d1\d2", 0)
+    return box & "\d1\d2"
+end function
+
+'' fisierele scrise in afara destinatiei (in cutie, langa ea)
+function Escaped(byref dest as const ustring) as string
+    dim as ustring box = left(dest, len(dest) - len("\d1\d2"))
+    dim as ustring files()
+    ListFiles(box, files())
+    dim as string r
+    for i as integer = 0 to ubound(files)
+        if left(files(i), len(dest) + 1) <> dest & "\" then
+            dim as string f8 = mid(files(i), len(box) + 2)
+            r &= " " & f8
+        end if
+    next
+    return r
+end function
+
+'' arhiva cu o singura intrare, numele dat si continutul = numele (UTF-8)
+function OneEntryArchive(byref name_ as const ustring) as string
+    dim as ZipArchive w
+    if w.CreateInMemory() <> 0 then return ""
+    dim as string content = name_
+    if w.AddBytes(name_, content) <> 0 then return ""
+    dim as string b
+    w.ToBytes(b)
+    return b
+end function
+
+'' extrage arhiva din fisier (zip_extract) si din memorie (zip_stream_extract), fiecare in cutia ei;
+'' verifica regula pentru intrarea unica cu numele name_; intoarce o problema sau ""
+function ExtractOneChecked(byref work as const ustring, byref name_ as const ustring, byref tag as const string, _
+        byref codes as string) as string
+    dim as string bytes = OneEntryArchive(name_)
+    if len(bytes) = 0 then return "arhiva nu s-a putut scrie"
+    dim as string content = name_
+    for how as long = 0 to 1
+        dim as ustring dest = SandboxDest(work, tag & "_" & how)
+        dim as long e
+        if how = 0 then
+            dim as ustring zp = work & "\arhiva_" & tag & ".zip"
+            if WriteAll(zp, bytes) = false then return "nu pot scrie arhiva"
+            e = ZipArchive.ExtractAll(zp, dest)
+        else
+            e = ZipArchive.ExtractAllFromMemory(bytes, dest)
+        end if
+        codes &= iif(how = 0, "fisier ", ", memorie ") & e
+        dim as string esc = Escaped(dest)
+        if len(esc) then return iif(how = 0, "fisier", "memorie") & ": scris in afara destinatiei:" & esc
+        if e = 0 then
+            '' un fisier vizibil in destinatie, cu datele intrarii
+            dim as ustring files()
+            ListFiles(dest, files())
+            dim as boolean found = false
+            for i as integer = 0 to ubound(files)
+                if ReadAll(files(i)) = content then found = true
+            next
+            if found = false then
+                return iif(how = 0, "fisier", "memorie") & ": extragere reusita, dar datele nu sunt in niciun fisier vizibil (" _
+                    & (ubound(files) + 1) & " fisiere)"
+            end if
+        end if
+    next
+    return ""
+end function
+
+'' ".." in orice pozitie nu urca deasupra destinatiei
+TEST_CASE( Extragere, UrcareCuPuncte )
+    dim as ustring d = WorkDir()
+    dim as ustring names(...) = { "../sus1.txt", "../../sus2.txt", "a/../../sus3.txt", "..\..\sus4.txt", _
+        "./../sus5.txt", "a/b/../../../sus6.txt", "../d2/../../sus7.txt", "a/./../.././sus8.txt" }
+    for i as long = 0 to ubound(names)
+        dim as string n8 = names(i)
+        TEST_CONTEXT( n8 )
+        dim as string codes
+        dim as string bad = ExtractOneChecked(d, names(i), "u" & i, codes)
+        CHECK_MSG( bad = "", bad )
+        TestLog( n8 & ": " & codes )
+    next
+END_TEST_CASE
+
+'' o cale absoluta din arhiva ramane sub destinatie sau e refuzata
+TEST_CASE( Extragere, CaleAbsoluta )
+    dim as ustring d = WorkDir()
+    '' calea absoluta a cutiei insesi: daca ar fi respectata, fisierul ar aparea langa destinatie
+    dim as ustring boxAbs = d & "\cutie_a"
+    dim as ustring slashAbs = boxAbs
+    for k as integer = 0 to len(slashAbs) - 1
+        if slashAbs[k] = asc("\") then slashAbs[k] = asc("/")
+    next
+    dim as ustring names(...) = { "/abs1.txt", "//abs2.txt", "\abs3.txt", boxAbs & "_0\abs4.txt", _
+        slashAbs & "_0/abs5.txt", "\\?\" & boxAbs & "_0\abs6.txt", "\\localhost\" & mid(boxAbs, 1, 1) & "$" & mid(boxAbs, 3) & "_0\abs7.txt" }
+    for i as long = 0 to ubound(names)
+        dim as string n8 = names(i)
+        TEST_CONTEXT( n8 )
+        dim as string codes
+        '' toate in aceeasi cutie "a", ca boxAbs sa fie cutia folosita
+        dim as string bad = ExtractOneChecked(d, names(i), "a", codes)
+        CHECK_MSG( bad = "", bad )
+        TestLog( n8 & ": " & codes )
+    next
+END_TEST_CASE
+
+'' nume pe care Windows le trateaza special: dispozitive, ":" (flux NTFS), punct si spatiu la final,
+'' caractere interzise. Nicio intrare nu se pierde fara eroare; ":" si numele de dispozitiv sunt
+'' refuzate cu ZIP_EINVENTNAME (altfel datele ajungeau in fluxul ascuns sau in dispozitiv)
+TEST_CASE( Extragere, NumeWindows )
+    dim as ustring d = WorkDir()
+    dim as ustring names(...) = { "nul", "NUL.txt", "con", "aux.txt", "dir/nul", "COM1", "lpt9.bin", _
+        "flux:ascuns.txt", "C:relativ.txt", "punct.", "spatiu ", "mai<mic.txt", "intrebare?.txt", _
+        "ghilimele"".txt", "bara|.txt", "consola.txt", "nul_nu.txt" }
+    '' primele 9 sunt refuzate
+    const REFUSED = 9
+    for i as long = 0 to ubound(names)
+        dim as string n8 = names(i)
+        TEST_CONTEXT( n8 )
+        dim as string codes
+        dim as string bad = ExtractOneChecked(d, names(i), "w" & i, codes)
+        CHECK_MSG( bad = "", bad )
+        if i < REFUSED then
+            CHECK_EQ( codes, "fisier " & ZIP_EINVENTNAME & ", memorie " & ZIP_EINVENTNAME )
+        end if
+        TestLog( n8 & ": " & codes )
+    next
+END_TEST_CASE
+
+'' nume care pe NTFS sunt acelasi fisier: al doilea il suprascrie pe primul, fara eroare
+TEST_CASE( Extragere, AcelasiFisier )
+    dim as ustring d = WorkDir()
+    dim as ustring dest = SandboxDest(d, "s")
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    REQUIRE_EQ( w.AddBytes("Mare.txt", "1"), 0 )
+    REQUIRE_EQ( w.AddBytes("mare.txt", "2"), 0 )
+    REQUIRE_EQ( w.AddBytes("x.txt", "3"), 0 )
+    REQUIRE_EQ( w.AddBytes("x.txt", "4"), 0 )
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    CHECK_EQ( ZipArchive.ExtractAllFromMemory(bytes, dest), 0 )
+    dim as ustring files()
+    ListFiles(dest, files())
+    CHECK_EQ( clngint(ubound(files) + 1), 2ll )
+    CHECK_EQ( ReadAll(dest & "\mare.txt"), "2" )
+    CHECK_EQ( ReadAll(dest & "\x.txt"), "4" )
+    CHECK_EQ( Escaped(dest), "" )
+END_TEST_CASE
+
+'' un fisier si apoi un director cu acelasi nume: eroare, iar fisierul ramane neatins
+TEST_CASE( Extragere, FisierApoiDirector )
+    dim as ustring d = WorkDir()
+    dim as ustring dest = SandboxDest(d, "f")
+    dim as ZipArchive w
+    REQUIRE_EQ( w.CreateInMemory(), 0 )
+    REQUIRE_EQ( w.AddBytes("x", "fisier"), 0 )
+    REQUIRE_EQ( w.AddBytes("x/y.txt", "sub"), 0 )
+    dim as string bytes
+    REQUIRE_EQ( w.ToBytes(bytes), 0 )
+    CHECK_LT( ZipArchive.ExtractAllFromMemory(bytes, dest), 0 )
+    CHECK_EQ( ReadAll(dest & "\x"), "fisier" )
+    CHECK_EQ( Escaped(dest), "" )
+    '' invers: director, apoi fisier cu acelasi nume
+    dim as ustring dest2 = SandboxDest(d, "g")
+    dim as ZipArchive w2
+    REQUIRE_EQ( w2.CreateInMemory(), 0 )
+    REQUIRE_EQ( w2.AddDirectory("x"), 0 )
+    REQUIRE_EQ( w2.AddBytes("x", "fisier"), 0 )
+    REQUIRE_EQ( w2.ToBytes(bytes), 0 )
+    CHECK_LT( ZipArchive.ExtractAllFromMemory(bytes, dest2), 0 )
+    CHECK_EQ( Escaped(dest2), "" )
+END_TEST_CASE
+
+'' calea finala peste 260 de caractere: eroare sau fisierul complet (citit prin \\?\)
+TEST_CASE( Extragere, CaleLunga )
+    dim as ustring d = WorkDir()
+    dim as ustring dest = SandboxDest(d, "l")
+    dim as ustring name_ = string(100, "a") & "/" & string(100, "b") & "/" & string(100, "c") & ".txt"
+    dim as string bytes = OneEntryArchive(name_)
+    REQUIRE_TRUE( len(bytes) > 0 )
+    dim as long e = ZipArchive.ExtractAllFromMemory(bytes, dest)
+    TestLog( "ExtractAllFromMemory: " & e & ", lungimea caii: " & len(dest) + 1 + len(name_) )
+    if e = 0 then
+        dim as ustring full = "\\?\" & dest & "\" & string(100, "a") & "\" & string(100, "b") & "\" & string(100, "c") & ".txt"
+        dim as string want = name_
+        CHECK_TRUE( ReadAll(full) = want )
+    end if
+    CHECK_EQ( Escaped(dest), "" )
 END_TEST_CASE
 
 end TestKitMain( )
