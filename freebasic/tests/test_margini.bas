@@ -1,6 +1,7 @@
 '' test_margini.bas - marginile legaturii FreeBASIC cu TestKit, dincolo de test_c si test_fb:
 '' dimensiuni de date si CRC calculat independent, niveluri de compresie, citire pe bucati (nivelul 1),
-'' arhive stricate, nume de intrari, extragere periculoasa, volum si zip64.
+'' arhive stricate, nume de intrari, extragere periculoasa, volum si zip64, intrari si arhive peste 4 GB
+'' (grupul 8, doar cu ZIP_MARGINI_MARE=1).
 ''
 ''   fbc64 -w all -exx test_margini.bas -i ..\inc -i ..\..\..\TestKit -p out\lib -p ..\bin-win64
 ''   test_margini [--filter=Date.*] [--isolate] [-v]          (libzip.dll langa exe)
@@ -25,12 +26,18 @@ for i as long = 0 to 255
     CRC_TAB(i) = c
 next
 
-function Crc32Of(byref s as const string) as ulong
-    dim as ulong c = &hFFFFFFFF
-    for i as integer = 0 to len(s) - 1
-        c = CRC_TAB((c xor s[i]) and 255) xor (c shr 8)
+'' CRC-ul continuat cu n octeti de la p; crc = CRC-ul octetilor de dinainte (0 la inceput)
+function Crc32Add(byval crc as ulong, byval p as const ubyte ptr, byval n as integer) as ulong
+    dim as const ulong ptr t = @CRC_TAB(0)
+    dim as ulong c = not crc
+    for i as integer = 0 to n - 1
+        c = t[(c xor p[i]) and 255] xor (c shr 8)
     next
     return not c
+end function
+
+function Crc32Of(byref s as const string, byval crc as ulong = 0) as ulong
+    return Crc32Add(crc, cast(const ubyte ptr, strptr(s)), len(s))
 end function
 
 '' felul datelor: zerouri (foarte comprimabile), aleatoare (necomprimabile), text (comprimabil normal)
@@ -177,6 +184,9 @@ TEST_CASE( Date, CrcPropriu )
     CHECK_EQ( Crc32Of(""), 0ul )
     CHECK_EQ( Crc32Of("123456789"), &hCBF43926ul )
     CHECK_EQ( Crc32Of("The quick brown fox jumps over the lazy dog"), &h414FA339ul )
+    '' continuat pe bucati, ca la datele de peste 4 GB
+    CHECK_EQ( Crc32Of("56789", Crc32Of("1234")), &hCBF43926ul )
+    CHECK_EQ( Crc32Of("", Crc32Of("123456789")), &hCBF43926ul )
 END_TEST_CASE
 
 TEST_CASE( Date, DimensiuniInMemorie )
@@ -1693,6 +1703,519 @@ TEST_CASE( Volum, DeschideriRepetate )
     dim as longint grown = PrivateBytes() - before
     TestLog( "memoria privata a crescut cu " & grown \ 1024 & " KB in 2000 de cicluri" )
     CHECK_MSG( grown < 16 * 1024 * 1024, "memoria a crescut cu " & grown \ 1024 & " KB" )
+END_TEST_CASE
+
+'' ================================================================== 8. peste 4 GB
+'' Intrari si arhive de peste 4 GB, unde campurile de 32 de biti (dimensiunile, offsetul antetului local,
+'' al directorului central) nu mai ajung. Testele scriu si citesc cate 4-8 GB pe disc si dureaza minute,
+'' deci ruleaza doar cu ZIP_MARGINI_MARE=1 (altfel sunt sarite) si cu cel putin 12 GB liberi. Cu
+'' ZIP_MARGINI_PYTHON=<python.exe> arhivele se verifica si cu zipfile din Python (verifica_zip.py, langa
+'' test_margini.bas). Datele se genereaza pe bucati de 1 MB, deci nimic de 4 GB nu sta in memorie;
+'' fisierele mari se sterg la sfarsitul fiecarui test, si cand testul pica.
+
+const GB4 = 4294967296ll                  '' 2^32
+const BIG_SIZE = GB4 + 3                  '' intrarea mare: 4 GB + 3 octeti
+const BIG_CHUNK = 1048576
+const PART_SIZE = 64 * BIG_CHUNK          '' intrarile "mici" ale arhivelor de peste 4 GB
+const PARTS_4G = 64                       '' 64 x 64 MB = 4 GB: antetul de dupa ele trece de 4 GB
+const BIG_FREE_GB = 12
+
+'' de ce se sare un test mare ("" = se ruleaza)
+function BigSkipReason() as string
+    if environ("ZIP_MARGINI_MARE") <> "1" then return "peste 4 GB: doar cu ZIP_MARGINI_MARE=1"
+    dim as ULARGE_INTEGER avail
+    dim as ustring root = exepath
+    if GetDiskFreeSpaceExW(root, @avail, 0, 0) = 0 then return "spatiul liber de pe disc nu se poate afla"
+    dim as longint gb = avail.QuadPart \ 1073741824ull
+    if gb < BIG_FREE_GB then return "peste 4 GB: doar " & gb & " GB liberi, trebuie " & BIG_FREE_GB
+    return ""
+end function
+
+'' directorul testului, golit si cand testul se termina (si dupa un REQUIRE picat)
+type BigWorkDir
+    as ustring dir_
+    declare destructor()
+end type
+
+destructor BigWorkDir()
+    if len(dir_) then ClearDir(dir_)
+end destructor
+
+'' bucata k a datelor mari (BIG_CHUNK octeti): un bloc fix, aleator sau text, cu k in primii 8 octeti,
+'' ca o bucata citita de la alt offset (de exemplu trunchiat la 32 de biti) sa schimbe CRC-ul
+dim shared as string BIG_BLOCK_RAND, BIG_BLOCK_TEXT
+
+sub BigChunk(byval k as longint, byval kind as DataKind, byref buf as string)
+    if len(BIG_BLOCK_RAND) = 0 then
+        BIG_BLOCK_RAND = MakeData(BIG_CHUNK, KindRandom, 31337)
+        BIG_BLOCK_TEXT = MakeData(BIG_CHUNK, KindText)
+    end if
+    if kind = KindRandom then buf = BIG_BLOCK_RAND else buf = BIG_BLOCK_TEXT
+    *cast(longint ptr, strptr(buf)) = k
+end sub
+
+'' intrarea "mica" i: 64 de bucati aleatoare consecutive
+function PartData(byval i as long) as string
+    dim as string s = space(PART_SIZE), c
+    for j as long = 0 to PART_SIZE \ BIG_CHUNK - 1
+        BigChunk(clngint(i) * (PART_SIZE \ BIG_CHUNK) + j, KindRandom, c)
+        memcpy(strptr(s) + j * BIG_CHUNK, strptr(c), BIG_CHUNK)
+    next
+    return s
+end function
+
+function PartName(byval i as long) as string
+    return "parte_" & right("00" & i, 3) & ".bin"
+end function
+
+'' scrie size octeti de date mari in intrarea deschisa (nivelul 1), pe bucati; CRC-ul lor in crc
+function WriteBigEntry(byval z as zip_t ptr, byval size as longint, byval kind as DataKind, byref crc as ulong) as long
+    dim as string c
+    dim as longint rest = size, k = 0
+    crc = 0
+    while rest > 0
+        BigChunk(k, kind, c)
+        dim as integer n = iif(rest < BIG_CHUNK, rest, BIG_CHUNK)
+        crc = Crc32Add(crc, cast(const ubyte ptr, strptr(c)), n)
+        dim as long e = zip_entry_write(z, strptr(c), n)
+        if e <> 0 then return e
+        rest -= n
+        k += 1
+    wend
+    return 0
+end function
+
+'' acelasi sir de date intr-un fisier
+function WriteBigFile(byref p as const ustring, byval size as longint, byval kind as DataKind, byref crc as ulong) as boolean
+    dim as HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    if h = INVALID_HANDLE_VALUE then return false
+    dim as string c
+    dim as longint rest = size, k = 0
+    crc = 0
+    while rest > 0
+        BigChunk(k, kind, c)
+        dim as integer n = iif(rest < BIG_CHUNK, rest, BIG_CHUNK)
+        crc = Crc32Add(crc, cast(const ubyte ptr, strptr(c)), n)
+        dim as DWORD written = 0
+        if WriteFile(h, strptr(c), n, @written, 0) = 0 orelse written <> n then
+            CloseHandle(h)
+            return false
+        end if
+        rest -= n
+        k += 1
+    wend
+    CloseHandle(h)
+    return true
+end function
+
+function BigFileSize(byref p as const ustring) as longint
+    dim as WIN32_FILE_ATTRIBUTE_DATA a
+    if GetFileAttributesExW(p, GetFileExInfoStandard, @a) = 0 then return -1
+    return (clngint(a.nFileSizeHigh) shl 32) or a.nFileSizeLow
+end function
+
+'' citeste fisierul pe bucati: intoarce cati octeti a citit (-1 la eroare), CRC-ul lor in crc
+function BigFileCrc(byref p as const ustring, byref crc as ulong) as longint
+    dim as HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, 0)
+    if h = INVALID_HANDLE_VALUE then return -1
+    dim as string buf = space(BIG_CHUNK)
+    dim as longint total = 0
+    crc = 0
+    do
+        dim as DWORD got = 0
+        if ReadFile(h, strptr(buf), BIG_CHUNK, @got, 0) = 0 then
+            total = -1
+            exit do
+        end if
+        if got = 0 then exit do
+        crc = Crc32Add(crc, cast(const ubyte ptr, strptr(buf)), got)
+        total += got
+    loop
+    CloseHandle(h)
+    return total
+end function
+
+'' o intrare scrisa la nivelul 1 dintr-o data; intoarce primul cod de eroare
+function AddLevel1(byval z as zip_t ptr, byref name_ as const string, byref data_ as const string) as long
+    dim as string n8 = name_
+    dim as long e = zip_entry_open(z, strptr(n8))
+    if e <> 0 then return e
+    if len(data_) then e = zip_entry_write(z, strptr(data_), len(data_))
+    dim as long c = zip_entry_close(z)
+    return iif(e <> 0, e, c)
+end function
+
+'' CRC-ul bucatilor date de zip_entry_extract, fara sa le pastreze
+type BigCollector
+    as ulong crc
+    as ulongint total
+    as long calls
+    as boolean contiguous = true
+end type
+
+function OnBigChunk cdecl(byval arg as any ptr, byval offset as ulongint, byval data_ as const any ptr, _
+        byval size as uinteger) as uinteger
+    dim as BigCollector ptr c = arg
+    c->calls += 1
+    if offset <> c->total then c->contiguous = false
+    c->crc = Crc32Add(c->crc, data_, size)
+    c->total += size
+    return size
+end function
+
+'' verifica arhiva cu verifica_zip.py (zipfile din Python), cand ZIP_MARGINI_PYTHON e dat
+sub PyCheck(byref zipPath as const ustring, byref args as const string)
+    dim as string py = environ("ZIP_MARGINI_PYTHON")
+    if len(py) = 0 then
+        TestLog( "fara verificare Python (set ZIP_MARGINI_PYTHON=python.exe)" )
+        exit sub
+    end if
+    dim as string script = exepath & "\..\verifica_zip.py"
+    dim as ustring scriptU = script
+    REQUIRE_MSG( FileExists(scriptU), "lipseste " & script )
+    dim as string z8 = zipPath, out8 = z8 & ".python.txt", q = chr(34)
+    '' cmd /c scoate ghilimelele de la capete, deci toata linia mai primeste o pereche
+    dim as long rc = shell(q & q & py & q & " -I " & q & script & q & " " & q & z8 & q & " " & args _
+        & " > " & q & out8 & q & " 2>&1" & q)
+    dim as ustring outU = out8
+    dim as string text = rtrim(ReadAll(outU), any chr(13, 10))
+    TestLog( "python " & args & ": " & text )
+    CHECK_MSG( rc = 0, "verifica_zip.py " & args & ": cod " & rc & ": " & text )
+end sub
+
+'' secunde de la t0, pentru jurnal
+function Since(byval t0 as double) as string
+    return fix(timer - t0) & " s"
+end function
+
+'' o intrare de 4 GB + 3 octeti, comprimata (text: comprimata ramane sub 4 GB, deci doar dimensiunea
+'' necomprimata are nevoie de zip64), scrisa pe bucati cu zip_entry_write si citita inapoi pe bucati
+'' cu zip_entry_extract, cu o fereastra peste granita de 4 GB si cu ExtractEntry intr-un fisier
+TEST_CASE( Mare, IntrarePeste4G )
+    dim as string why = BigSkipReason()
+    if len(why) then SKIP_TEST( why )
+    dim as BigWorkDir work
+    work.dir_ = WorkDir()
+    dim as ustring d = work.dir_
+    dim as string p8 = d & "\mare.zip"
+
+    dim as double t0 = timer
+    dim as zip_t ptr z = zip_open(strptr(p8), 1, asc("w"))
+    REQUIRE_TRUE( z <> 0 )
+    dim as ulong crc
+    dim as long eWrite = zip_entry_open(z, "mare.bin")
+    if eWrite = 0 then eWrite = WriteBigEntry(z, BIG_SIZE, KindText, crc)
+    dim as long eClose = zip_entry_close(z)
+    dim as long eSmall = AddLevel1(z, "dupa.txt", "dupa")
+    zip_close(z)
+    CHECK_EQ( eWrite, 0 )
+    CHECK_EQ( eClose, 0 )
+    CHECK_EQ( eSmall, 0 )
+    TestLog( "scris in " & Since(t0) & ", CRC &h" & hex(crc) & ", arhiva de " & BigFileSize(p8) & " octeti" )
+
+    '' nivelul 2: dimensiunile si CRC-ul din directorul central, ExtractEntry
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p8), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    CHECK_EQ( r.Count, 2 )
+    dim as ZipEntryInfo info
+    REQUIRE_EQ( r.FindEntry("mare.bin", info), 0 )
+    CHECK_EQ( info.Size, culngint(BIG_SIZE) )
+    CHECK_EQ( info.Crc32, crc )
+    CHECK_LT( info.CompressedSize, culngint(GB4) )
+    t0 = timer
+    dim as ustring dst = d & "\extras.bin"
+    CHECK_EQ( r.ExtractEntry("mare.bin", dst), 0 )
+    CHECK_EQ( BigFileSize(dst), BIG_SIZE )
+    dim as ulong fileCrc
+    CHECK_EQ( BigFileCrc(dst, fileCrc), BIG_SIZE )
+    CHECK_EQ( fileCrc, crc )
+    TestLog( "ExtractEntry si citirea fisierului: " & Since(t0) )
+    DeleteFileW(dst)
+    dim as string got
+    CHECK_EQ( r.ReadBytes("dupa.txt", got), 0 )
+    CHECK_EQ( got, "dupa" )
+    r.Close()
+
+    '' nivelul 1: zip_entry_extract pe bucati, cu CRC-ul calculat aici
+    t0 = timer
+    z = zip_open(strptr(p8), 0, asc("r"))
+    REQUIRE_TRUE( z <> 0 )
+    REQUIRE_EQ( zip_entry_open(z, "mare.bin"), 0 )
+    CHECK_EQ( zip_entry_size(z), culngint(BIG_SIZE) )
+    CHECK_EQ( zip_entry_crc32(z), crc )
+    dim as BigCollector col
+    CHECK_EQ( zip_entry_extract(z, @OnBigChunk, @col), 0 )
+    CHECK_TRUE( col.contiguous )
+    CHECK_EQ( col.total, culngint(BIG_SIZE) )
+    CHECK_EQ( col.crc, crc )
+    TestLog( "zip_entry_extract: " & col.calls & " apeluri, " & Since(t0) )
+    '' o fereastra peste granita de 4 GB (offset peste 32 de biti): ultimii 5 octeti ai bucatii 4095,
+    '' apoi cei 3 octeti ai bucatii 4096
+    dim as string c1, c2, win
+    BigChunk(4095, KindText, c1)
+    BigChunk(4096, KindText, c2)
+    CHECK_EQ( ReadWindow(z, GB4 - 5, 100, 100, win), 8ll )
+    CHECK_TRUE( win = right(c1, 5) & left(c2, 3) )
+    zip_entry_close(z)
+    zip_close(z)
+
+    PyCheck(p8, "--zip64 --intrari 2 --dimensiune mare.bin " & BIG_SIZE & " --citeste mare.bin --citeste dupa.txt")
+END_TEST_CASE
+
+'' AddFile (zip_entry_fwrite) dintr-un fisier de 4 GB + 3 octeti, stocat (nivelul 0): si dimensiunea
+'' comprimata trece de 4 GB, iar intrarea urmatoare are antetul peste 4 GB; ExtractEntry
+'' (zip_entry_fread) da inapoi fisierul intreg
+TEST_CASE( Mare, AddFileStocatPeste4G )
+    dim as string why = BigSkipReason()
+    if len(why) then SKIP_TEST( why )
+    dim as BigWorkDir work
+    work.dir_ = WorkDir()
+    dim as ustring d = work.dir_
+    dim as ustring src = d & "\sursa.bin", p = d & "\stocat.zip", dst = d & "\extras.bin"
+
+    dim as double t0 = timer
+    dim as ulong crc
+    REQUIRE_TRUE( WriteBigFile(src, BIG_SIZE, KindRandom, crc) )
+    dim as ZipArchive w
+    REQUIRE_EQ( w.OpenFile(p, ZipWrite, 0), 0 )
+    CHECK_EQ( w.AddFile("sursa.bin", src), 0 )
+    CHECK_EQ( w.AddText("dupa.txt", "dupa granita"), 0 )
+    w.Close()
+    TestLog( "sursa si arhiva scrise in " & Since(t0) & ", CRC &h" & hex(crc) )
+    '' loc pentru fisierul extras
+    DeleteFileW(src)
+
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    CHECK_EQ( r.Count, 2 )
+    dim as ZipEntryInfo info
+    REQUIRE_EQ( r.FindEntry("sursa.bin", info), 0 )
+    CHECK_EQ( info.Size, culngint(BIG_SIZE) )
+    CHECK_EQ( info.CompressedSize, culngint(BIG_SIZE) )
+    CHECK_EQ( info.Crc32, crc )
+    t0 = timer
+    CHECK_EQ( r.ExtractEntry("sursa.bin", dst), 0 )
+    CHECK_EQ( BigFileSize(dst), BIG_SIZE )
+    dim as ulong fileCrc
+    CHECK_EQ( BigFileCrc(dst, fileCrc), BIG_SIZE )
+    CHECK_EQ( fileCrc, crc )
+    TestLog( "ExtractEntry si citirea fisierului: " & Since(t0) )
+    DeleteFileW(dst)
+    dim as ustring t, wantT = "dupa granita"
+    CHECK_EQ( r.ReadText("dupa.txt", t), 0 )
+    CHECK_EQ( t, wantT )
+    r.Close()
+
+    dim as string p8 = p
+    dim as zip_t ptr z = zip_open(strptr(p8), 0, asc("r"))
+    REQUIRE_TRUE( z <> 0 )
+    REQUIRE_EQ( zip_entry_open(z, "dupa.txt"), 0 )
+    CHECK_GT( zip_entry_header_offset(z), culngint(GB4) )
+    zip_entry_close(z)
+    zip_close(z)
+
+    PyCheck(p, "--zip64 --intrari 2 --dimensiune sursa.bin " & BIG_SIZE & " --peste-4g dupa.txt --citeste sursa.bin --citeste dupa.txt")
+END_TEST_CASE
+
+'' pentru arhivele din intrari de 64 MB: numele, dimensiunea si CRC-ul intrarilor first..last, iar
+'' datele citite (ReadBytesAt) au CRC-ul asteptat
+sub CheckParts(byref r as ZipArchive, crcs() as ulong, byval first as long, byval last as long)
+    for i as long = first to last
+        TEST_CONTEXT( PartName(i) )
+        dim as ZipEntryInfo info
+        REQUIRE_EQ( r.GetEntry(i, info), 0 )
+        dim as ustring wantName = PartName(i)
+        CHECK_EQ( info.Name, wantName )
+        CHECK_EQ( info.Size, culngint(PART_SIZE) )
+        CHECK_EQ( info.Crc32, crcs(i) )
+        dim as string got
+        CHECK_EQ( r.ReadBytesAt(i, got), 0 )
+        CHECK_EQ( clngint(len(got)), clngint(PART_SIZE) )
+        CHECK_EQ( Crc32Of(got), crcs(i) )
+    next
+end sub
+
+'' o arhiva zip64 care trece de 4 GB prin intrari de 64 MB (stocate): intrarile de dupa granita au
+'' antetul local peste 4 GB (offsetul e doar in campul zip64 extins), si dupa o adaugare cu "a"
+TEST_CASE( Mare, ArhivaPeste4G )
+    dim as string why = BigSkipReason()
+    if len(why) then SKIP_TEST( why )
+    dim as BigWorkDir work
+    work.dir_ = WorkDir()
+    dim as ustring d = work.dir_
+    dim as ustring p = d & "\peste4g.zip"
+
+    dim as double t0 = timer
+    dim as ulong crcs(0 to PARTS_4G - 1)
+    dim as ZipArchive w
+    REQUIRE_EQ( w.OpenFile(p, ZipWrite, 0), 0 )
+    for i as long = 0 to PARTS_4G - 1
+        dim as string s = PartData(i)
+        crcs(i) = Crc32Of(s)
+        REQUIRE_EQ( w.AddBytes(PartName(i), s), 0 )
+    next
+    dim as string small = MakeData(100003, KindRandom, 4321)
+    CHECK_EQ( w.AddBytes("dupa/aleator.bin", small), 0 )
+    CHECK_EQ( w.AddText("dupa/text.txt", "dupa granita"), 0 )
+    w.Close()
+    '' adaugare la arhiva de peste 4 GB, cu compresie
+    dim as string txt = MakeData(300007, KindText)
+    dim as ZipArchive a
+    REQUIRE_EQ( a.OpenFile(p, ZipAppend, 6), 0 )
+    CHECK_EQ( a.AddBytes("adaugat.txt", txt), 0 )
+    a.Close()
+    TestLog( "scris in " & Since(t0) & ", arhiva de " & BigFileSize(p) & " octeti" )
+
+    t0 = timer
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    REQUIRE_EQ( r.Count, clngint(PARTS_4G + 3) )
+    CheckParts(r, crcs(), 0, PARTS_4G - 1)
+    dim as string got
+    CHECK_EQ( r.ReadBytes("dupa/aleator.bin", got), 0 )
+    CHECK_TRUE( got = small )
+    dim as ustring t, wantT = "dupa granita"
+    CHECK_EQ( r.ReadText("dupa/text.txt", t), 0 )
+    CHECK_EQ( t, wantT )
+    CHECK_EQ( r.ReadBytes("adaugat.txt", got), 0 )
+    CHECK_TRUE( got = txt )
+    r.Close()
+    TestLog( "citit in " & Since(t0) )
+
+    '' nivelul 1: ultima intrare de 64 MB incepe sub 4 GB, cele de dupa ea peste
+    dim as string p8 = p
+    dim as zip_t ptr z = zip_open(strptr(p8), 0, asc("r"))
+    REQUIRE_TRUE( z <> 0 )
+    for i as long = PARTS_4G - 1 to PARTS_4G + 2
+        TEST_CONTEXT( "index " & i )
+        REQUIRE_EQ( zip_entry_openbyindex(z, i), 0 )
+        dim as ulongint ofs = zip_entry_header_offset(z)
+        if i < PARTS_4G then
+            CHECK_LT( ofs, culngint(GB4) )
+        else
+            CHECK_GT( ofs, culngint(GB4) )
+        end if
+        TestLog( *zip_entry_name(z) & ": antetul la " & ofs )
+        zip_entry_close(z)
+    next
+    zip_close(z)
+
+    PyCheck(p, "--zip64 --intrari " & PARTS_4G + 3 & " --peste-4g dupa/aleator.bin --peste-4g dupa/text.txt" _
+        & " --peste-4g adaugat.txt --testzip")
+END_TEST_CASE
+
+'' o arhiva fara zip64 ("w" - 64, ca una facuta de alt program) trece de 4 GB prin adaugare cu "a": la
+'' inchidere trebuie sa treaca pe zip64 (660aca8); inainte, directorul central nou nu incapea in EOCD-ul
+'' clasic, nu se mai scria, iar cel vechi fusese deja suprascris de intrarea noua
+TEST_CASE( Mare, ClasicPeste4GPrinAdaugare )
+    dim as string why = BigSkipReason()
+    if len(why) then SKIP_TEST( why )
+    dim as BigWorkDir work
+    work.dir_ = WorkDir()
+    dim as ustring d = work.dir_
+    dim as string p8 = d & "\clasic.zip"
+
+    '' 63 de intrari de 64 MB: sub 4 GB
+    dim as double t0 = timer
+    dim as ulong crcs(0 to PARTS_4G - 1)
+    dim as zip_t ptr z = zip_open(strptr(p8), 0, asc("w") - 64)
+    REQUIRE_TRUE( z <> 0 )
+    dim as long eWrite = 0
+    for i as long = 0 to PARTS_4G - 2
+        dim as string s = PartData(i)
+        crcs(i) = Crc32Of(s)
+        eWrite = AddLevel1(z, PartName(i), s)
+        if eWrite <> 0 then exit for
+    next
+    zip_close(z)
+    REQUIRE_EQ( eWrite, 0 )
+    TestLog( "arhiva clasica scrisa in " & Since(t0) & ", " & BigFileSize(p8) & " octeti" )
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p8), 0 )
+    CHECK_TRUE( r.IsZip64() = false )
+    CHECK_EQ( r.Count, clngint(PARTS_4G - 1) )
+    r.Close()
+    PyCheck(p8, "--clasic --intrari " & PARTS_4G - 1)
+
+    '' a 64-a intrare: antetul ei e inca sub 4 GB, dar arhiva trece de 4 GB
+    dim as string last_ = PartData(PARTS_4G - 1)
+    crcs(PARTS_4G - 1) = Crc32Of(last_)
+    dim as ZipArchive a
+    REQUIRE_EQ( a.OpenFile(p8, ZipAppend, 0), 0 )
+    CHECK_EQ( a.AddBytes(PartName(PARTS_4G - 1), last_), 0 )
+    a.Close()
+    last_ = ""
+    TestLog( "dupa adaugare: " & BigFileSize(p8) & " octeti" )
+    CHECK_GT( BigFileSize(p8), GB4 )
+    REQUIRE_EQ( r.OpenFile(p8), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    REQUIRE_EQ( r.Count, clngint(PARTS_4G) )
+    CheckParts(r, crcs(), 0, PARTS_4G - 1)
+    r.Close()
+    PyCheck(p8, "--zip64 --intrari " & PARTS_4G & " --citeste " & PartName(PARTS_4G - 1))
+
+    '' acum e zip64: o noua adaugare are antetul peste 4 GB
+    REQUIRE_EQ( a.OpenFile(p8, ZipAppend, 6), 0 )
+    CHECK_EQ( a.AddText("dupa.txt", "dupa granita"), 0 )
+    a.Close()
+    REQUIRE_EQ( r.OpenFile(p8), 0 )
+    CHECK_EQ( r.Count, clngint(PARTS_4G + 1) )
+    dim as ustring t, wantT = "dupa granita"
+    CHECK_EQ( r.ReadText("dupa.txt", t), 0 )
+    CHECK_EQ( t, wantT )
+    r.Close()
+    PyCheck(p8, "--zip64 --intrari " & PARTS_4G + 1 & " --peste-4g dupa.txt --citeste dupa.txt")
+END_TEST_CASE
+
+'' o arhiva fara zip64 scrisa direct peste 4 GB, cu o intrare si dupa granita (ca la
+'' Volum.FaraZip64PesteLimita pentru 65535 de intrari): fiecare intrare se adauga, iar la inchidere
+'' arhiva trece pe zip64
+TEST_CASE( Mare, ClasicPeste4GScrisaDirect )
+    dim as string why = BigSkipReason()
+    if len(why) then SKIP_TEST( why )
+    dim as BigWorkDir work
+    work.dir_ = WorkDir()
+    dim as ustring d = work.dir_
+    dim as string p8 = d & "\clasic2.zip"
+
+    dim as double t0 = timer
+    dim as ulong crcs(0 to PARTS_4G - 1)
+    dim as zip_t ptr z = zip_open(strptr(p8), 0, asc("w") - 64)
+    REQUIRE_TRUE( z <> 0 )
+    dim as long written = 0, eWrite = 0
+    for i as long = 0 to PARTS_4G - 1
+        dim as string s = PartData(i)
+        crcs(i) = Crc32Of(s)
+        eWrite = AddLevel1(z, PartName(i), s)
+        if eWrite <> 0 then exit for
+        written += 1
+    next
+    if eWrite = 0 then
+        eWrite = AddLevel1(z, "dupa.txt", "dupa granita")
+        if eWrite = 0 then written += 1
+    end if
+    zip_close(z)
+    TestLog( "scris in " & Since(t0) & ", " & BigFileSize(p8) & " octeti, " & written & " intrari, ultimul cod " & eWrite )
+    CHECK_EQ( eWrite, 0 )
+    CHECK_EQ( written, PARTS_4G + 1 )
+
+    dim as ZipArchive r
+    REQUIRE_EQ( r.OpenFile(p8), 0 )
+    CHECK_TRUE( r.IsZip64() )
+    REQUIRE_EQ( r.Count, clngint(written) )
+    if written = PARTS_4G + 1 then
+        dim as ustring t, wantT = "dupa granita"
+        CHECK_EQ( r.ReadText("dupa.txt", t), 0 )
+        CHECK_EQ( t, wantT )
+    end if
+    dim as long lastPart = iif(written < PARTS_4G, written, PARTS_4G) - 1
+    CheckParts(r, crcs(), lastPart, lastPart)
+    r.Close()
+    PyCheck(p8, "--zip64 --intrari " & written & " --citeste " & PartName(lastPart) _
+        & iif(written = PARTS_4G + 1, " --peste-4g dupa.txt --citeste dupa.txt", ""))
 END_TEST_CASE
 
 end TestKitMain( )
