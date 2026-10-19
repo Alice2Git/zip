@@ -42,14 +42,15 @@ public:
     declare destructor()
 
     '' ---- deschidere si inchidere
-    '' fisier: openMode ZipRead, ZipWrite, ZipAppend sau ZipDelete; level 0-9 (doar la scriere);
+    '' fisier: openMode ZipRead, ZipWrite, ZipAppend sau ZipDelete; level 0-10 (conteaza doar la
+    '' scriere; negativ = implicit, peste 10 = ZIP_EINVLVL in orice mod);
     '' password: criptare PKWARE la scriere, decriptare la citire ("" = fara parola)
     declare function OpenFile(byref path as const ustring, byval openMode as ZipMode = ZipRead, _
         byval level as long = ZIP_DEFAULT_COMPRESSION_LEVEL, byref password as const ustring = "") as long
     '' arhiva din memorie: openMode ZipRead sau ZipDelete; datele se copiaza in obiect
     declare function OpenMemory(byref bytes as const string, byval openMode as ZipMode = ZipRead, _
         byref password as const ustring = "") as long
-    '' arhiva noua in memorie; rezultatul se ia cu ToBytes
+    '' arhiva noua in memorie, level ca la OpenFile; rezultatul se ia cu ToBytes
     declare function CreateInMemory(byval level as long = ZIP_DEFAULT_COMPRESSION_LEVEL, _
         byref password as const ustring = "") as long
     '' octetii unei arhive din memorie (dupa CreateInMemory sau OpenMemory cu ZipDelete);

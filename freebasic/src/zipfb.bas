@@ -43,6 +43,16 @@ private function PasswordPtr(byref pw8 as const string) as const zstring ptr
     return strptr(pw8)
 end function
 
+'' nivelul cel mai mare (MZ_UBER_COMPRESSION din miniz)
+const ZIP_MAX_LEVEL = 10
+
+'' biblioteca verifica doar level and &hF si trimite bitii de sus mai departe ca flag-uri miniz,
+'' deci 16 ar stoca fara compresie, iar &h400 ar face fiecare intrare sa pice; clasa accepta doar
+'' 0..10, iar un nivel negativ inseamna nivelul implicit, ca in biblioteca
+private function LevelIsValid(byval level as long) as boolean
+    return level <= ZIP_MAX_LEVEL
+end function
+
 constructor ZipArchive()
 end constructor
 
@@ -66,6 +76,7 @@ end function
 function ZipArchive.OpenFile(byref path as const ustring, byval openMode as ZipMode, byval level as long, _
         byref password as const ustring) as long
     this.Close()
+    if LevelIsValid(level) = false then return SetResult(ZIP_EINVLVL)
     dim as string p8 = path, pw8 = password
     dim as long e = 0
     if len(pw8) > 0 then
@@ -111,6 +122,7 @@ end function
 
 function ZipArchive.CreateInMemory(byval level as long, byref password as const ustring) as long
     this.Close()
+    if LevelIsValid(level) = false then return SetResult(ZIP_EINVLVL)
     dim as string pw8 = password
     dim as long e = 0
     if len(pw8) > 0 then

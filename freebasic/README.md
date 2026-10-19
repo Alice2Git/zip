@@ -25,7 +25,8 @@ freebasic/
 └── tests/
     ├── run_tests.cmd    compilează și rulează testele și exemplele
     ├── test_c.bas       nivelul 1: fiecare grup de funcții din zip.h
-    └── test_fb.bas      nivelul 2: toate metodele, căi cu diacritice, UNC și \\?\
+    ├── test_fb.bas      nivelul 2: toate metodele, căi cu diacritice, UNC și \\?\
+    └── test_margini.bas cu TestKit: dimensiuni de date și CRC, niveluri de compresie, citire pe bucăți
 ```
 
 ## Compilare
@@ -40,7 +41,7 @@ tests\run_tests.cmd <cale\fbc64.exe>
 
 - `build_native.cmd [director_msys2]` rulează CMake în `..\build-mingw`, apoi testele C ale bibliotecii (`ctest`), și copiază `libzip.dll` și `libzip.dll.a` în `bin-win64`. DLL-ul depinde doar de `KERNEL32.dll` și `msvcrt.dll`.
 - `build_lib.cmd [fbc64] [director_ieșire] [opțiuni fbc]` face `lib\libzip_fb.a`. Opțiunile (de exemplu `-gen gas64`) se dau după directorul de ieșire.
-- `tests\run_tests.cmd [fbc64]` construiește biblioteca nivelului 2 în `tests\out\lib`, apoi compilează și rulează testele și exemplele. Alt generator de cod se alege cu `set FBCOPTS=-gen gas64`. Fiecare rulare scrie într-un subdirector nou din `tests\out`.
+- `tests\run_tests.cmd [fbc64]` construiește biblioteca nivelului 2 în `tests\out\lib`, apoi compilează și rulează testele și exemplele. Alt generator de cod se alege cu `set FBCOPTS=-gen gas64`. Fiecare rulare scrie într-un subdirector nou din `tests\out`. `test_margini.bas` rulează doar dacă [TestKit](https://github.com/Alice2Git/TestKit) e în `%TESTKIT%` sau lângă depozit (`..\TestKit`); altfel e sărit.
 
 **Numai `libzip.dll.a`, niciodată un `.lib` de MSVC.** FreeBASIC leagă cu linkerul GNU, care are nevoie de biblioteca de import GNU.
 
@@ -127,6 +128,7 @@ ZipArchive.ExtractAll("arhivă.zip", "C:\Destinație")
 - Numele și căile sunt `USTRING`; conversia la UTF-8 se face în clasă. Datele intrărilor sunt `STRING` (octeți). `AddText` și `ReadText` lucrează cu text UTF-8.
 - Fiecare metodă deschide și închide singură intrarea. Nu rămâne nimic deschis între apeluri.
 - Un obiect nu se copiază. `OpenFile`, `OpenMemory` și `CreateInMemory` închid întâi arhiva deschisă; destructorul o închide și el. O arhivă scrisă într-un fișier se finalizează la închidere.
+- Nivelul de compresie e între 0 (fără compresie) și 10 (`MZ_UBER_COMPRESSION`); un nivel negativ înseamnă nivelul implicit (6). Peste 10, `OpenFile` (în orice mod) și `CreateInMemory` întorc `ZIP_EINVLVL` și nu creează nimic. Biblioteca C verifică doar `nivel and &hF` și dă biții de sus mai departe ca flag-uri miniz: la nivelul 1, `zip_open` acceptă de exemplu 16 (stochează fără compresie) sau `&h400` (fiecare `zip_entry_open` pică apoi cu `ZIP_EINVLVL`).
 
 ### Moduri
 
@@ -143,7 +145,7 @@ Celelalte metode întorc `ZIP_EINVMODE` și nu ating arhiva. În biblioteca C, `
 
 | Membru | Ce face |
 |---|---|
-| `OpenFile(cale, mod = ZipRead, nivel = 6, parolă = "")` | deschide un fișier; parola criptează (PKWARE) la scriere și decriptează la citire |
+| `OpenFile(cale, mod = ZipRead, nivel = 6, parolă = "")` | deschide un fișier; nivelul 0–10 contează doar la scriere; parola criptează (PKWARE) la scriere și decriptează la citire |
 | `OpenMemory(octeți, mod = ZipRead, parolă = "")` | deschide o arhivă din memorie (`ZipRead` sau `ZipDelete`); datele se copiază în obiect |
 | `CreateInMemory(nivel = 6, parolă = "")` | arhivă nouă în memorie |
 | `ToBytes(octeți)` | octeții unei arhive din memorie; după el, o arhivă creată în memorie nu mai primește intrări |
