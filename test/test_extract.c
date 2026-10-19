@@ -6,6 +6,7 @@
 #include "minunit.h"
 
 #if defined(_WIN32) || defined(_WIN64)
+#include <direct.h>
 #include <io.h>
 
 #define MKTEMP _mktemp
@@ -690,12 +691,78 @@ MU_TEST(test_extract_symlink_longname_rejected) {
 }
 #endif
 
+#if defined(_WIN32) || defined(_WIN64)
+// a one-entry archive in memory with the given name, extracted into dir
+static int extract_one_name(const char *name, const char *dir) {
+  void *buf = NULL;
+  size_t size = 0;
+  int r;
+  struct zip_t *zip =
+      zip_stream_open(NULL, 0, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+  if (!zip) {
+    return -1000;
+  }
+  zip_entry_open(zip, name);
+  zip_entry_write(zip, TESTDATA1, strlen(TESTDATA1));
+  zip_entry_close(zip);
+  zip_stream_copy(zip, &buf, &size);
+  zip_stream_close(zip);
+  r = zip_stream_extract((const char *)buf, size, dir, NULL, NULL);
+  free(buf);
+  return r;
+}
+
+MU_TEST(test_extract_windows_unsafe_names_rejected) {
+  // on Windows a ':' in a name writes the data to an NTFS alternate data
+  // stream ("a:b.txt" leaves an empty "a") and a reserved device name ("nul")
+  // sends it to a device; extraction reported success with the data hidden or
+  // lost. Such names are now rejected.
+  static const char *const unsafe[] = {
+      "nul",     "NUL.txt",  "dir/nul",       "con",    "Con.log",
+      "prn",     "aux.txt",  "COM1",          "lpt9.bin", "nul .txt",
+      "a:b.txt", "C:rel.txt", "dir\\x:y.txt", "sub/AUX/f.txt"};
+  static const char *const safe[] = {"nulx.txt",   "console.txt", "com10.txt",
+                                     "lpt.txt",    "a.nul",       "auxiliar/x.txt",
+                                     "dir/con_1.txt"};
+  char dir[] = "win-XXXXXX";
+  char rm[64];
+  size_t i;
+  mu_check(_mktemp(dir) != NULL);
+  mu_assert_int_eq(0, _mkdir(dir));
+
+  for (i = 0; i < sizeof(unsafe) / sizeof(unsafe[0]); ++i) {
+    mu_assert_int_eq(ZIP_EINVENTNAME, extract_one_name(unsafe[i], dir));
+  }
+  for (i = 0; i < sizeof(safe) / sizeof(safe[0]); ++i) {
+    mu_assert_int_eq(0, extract_one_name(safe[i], dir));
+  }
+
+  // zip_extract goes through the same check
+  {
+    struct zip_t *zip =
+        zip_open(ZIPNAME, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+    mu_check(zip != NULL);
+    mu_assert_int_eq(0, zip_entry_open(zip, "flux:ascuns.txt"));
+    mu_assert_int_eq(0, zip_entry_write(zip, TESTDATA1, strlen(TESTDATA1)));
+    mu_assert_int_eq(0, zip_entry_close(zip));
+    zip_close(zip);
+    mu_assert_int_eq(ZIP_EINVENTNAME, zip_extract(ZIPNAME, dir, NULL, NULL));
+  }
+
+  snprintf(rm, sizeof(rm), "rmdir /s /q %s", dir);
+  mu_check(system(rm) == 0);
+}
+#endif
+
 MU_TEST_SUITE(test_extract_suite) {
   MU_SUITE_CONFIGURE(&test_setup, &test_teardown);
 
   MU_RUN_TEST(test_extract);
   MU_RUN_TEST(test_extract_stream);
   MU_RUN_TEST(test_extract_cstream);
+#if defined(_WIN32) || defined(_WIN64)
+  MU_RUN_TEST(test_extract_windows_unsafe_names_rejected);
+#endif
 #if ZIP_HAVE_SYMLINK
   MU_RUN_TEST(test_extract_symlink_contained);
   MU_RUN_TEST(test_extract_symlink_absolute_rejected);

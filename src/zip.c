@@ -9,6 +9,7 @@
  */
 #define __STDC_WANT_LIB_EXT1__ 1
 
+#include <ctype.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -663,6 +664,60 @@ static mz_bool zip_symlink_target_escapes(const char *link_name,
 }
 #endif
 
+#if defined(_WIN32) || defined(__WIN32__)
+// Returns MZ_TRUE if a component of the (already normalized) name cannot be
+// created as an ordinary file on Windows: a ':' writes the data to an NTFS
+// alternate data stream of the part before it ("a:b.txt" leaves an empty "a"),
+// and a reserved device name ("nul", "con.txt", "COM1") sends it to a device,
+// so the extraction would report success while the data is hidden or lost.
+static mz_bool zip_name_is_unsafe_on_windows(const char *name) {
+  static const char *const devices[] = {"CON", "PRN", "AUX", "NUL"};
+  const char *p = name;
+
+  while (*p) {
+    const char *seg = p;
+    size_t len = 0, base = 0, i;
+    while (*p && !ISSLASH(*p)) {
+      if (*p == ':') {
+        return MZ_TRUE;
+      }
+      ++p;
+      ++len;
+    }
+    // the device name is the part before the first '.', without trailing
+    // spaces ("nul .txt" is still the device)
+    while (base < len && seg[base] != '.') {
+      ++base;
+    }
+    while (base > 0 && seg[base - 1] == ' ') {
+      --base;
+    }
+    if (base == 3) {
+      for (i = 0; i < sizeof(devices) / sizeof(devices[0]); ++i) {
+        if (toupper((unsigned char)seg[0]) == devices[i][0] &&
+            toupper((unsigned char)seg[1]) == devices[i][1] &&
+            toupper((unsigned char)seg[2]) == devices[i][2]) {
+          return MZ_TRUE;
+        }
+      }
+    } else if (base == 4 && seg[3] >= '1' && seg[3] <= '9') {
+      char a = (char)toupper((unsigned char)seg[0]);
+      char b = (char)toupper((unsigned char)seg[1]);
+      char c = (char)toupper((unsigned char)seg[2]);
+      if ((a == 'C' && b == 'O' && c == 'M') ||
+          (a == 'L' && b == 'P' && c == 'T')) {
+        return MZ_TRUE;
+      }
+    }
+    while (ISSLASH(*p)) {
+      ++p;
+    }
+  }
+
+  return MZ_FALSE;
+}
+#endif
+
 // Creates the directory of a directory entry whose name carries no trailing
 // separator. zip_mkpath only acts on components that end at a separator, so
 // such an entry never reaches it. Refuses a path already taken by something
@@ -753,6 +808,13 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
       err = ZIP_EINVENTNAME;
       goto out;
     }
+
+#if defined(_WIN32) || defined(__WIN32__)
+    if (zip_name_is_unsafe_on_windows(info.m_filename)) {
+      err = ZIP_EINVENTNAME;
+      goto out;
+    }
+#endif
 
     // a name that does not fit gets silently truncated by the copy below; the
     // symlink branch then measures escape depth from the full name while the
